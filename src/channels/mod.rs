@@ -490,17 +490,23 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
     }
 
     let trimmed = content.trim();
-    if !trimmed.starts_with('/') {
+    if !trimmed.starts_with('/') && !trimmed.starts_with('!') {
         return None;
     }
 
     let mut parts = trimmed.split_whitespace();
     let command_token = parts.next()?;
-    let base_command = command_token
+    // Strip bot mention suffix (e.g. /new@BotName) and normalize prefix (! → /)
+    let raw = command_token
         .split('@')
         .next()
         .unwrap_or(command_token)
         .to_ascii_lowercase();
+    let base_command = if let Some(stripped) = raw.strip_prefix('!') {
+        format!("/{stripped}")
+    } else {
+        raw
+    };
 
     match base_command.as_str() {
         "/models" => {
@@ -768,6 +774,15 @@ fn clear_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(sender_key);
+
+    // Async write-through: delete from SQLite
+    let memory = Arc::clone(&ctx.memory);
+    let key = sender_key.to_string();
+    tokio::spawn(async move {
+        if let Err(e) = memory.delete_conversation_history(&key).await {
+            tracing::warn!("Failed to delete conversation history from SQLite: {e}");
+        }
+    });
 }
 
 fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool {
@@ -801,20 +816,79 @@ fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool
         return false;
     }
 
-    *turns = compacted;
+    *turns = compacted.clone();
+
+    // Async write-through: persist compacted state to SQLite
+    let memory = Arc::clone(&ctx.memory);
+    let key = sender_key.to_string();
+    tokio::spawn(async move {
+        if let Err(e) = memory.save_conversation_history(&key, &compacted).await {
+            tracing::warn!("Failed to persist compacted conversation history: {e}");
+        }
+    });
+
     true
 }
 
-fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatMessage) {
-    let mut histories = ctx
+/// Lazy-load conversation history from SQLite if not already in the HashMap.
+/// Called once per sender session (first message after startup).
+async fn load_sender_history_if_needed(ctx: &ChannelRuntimeContext, sender_key: &str) {
+    let already_loaded = ctx
         .conversation_histories
         .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let turns = histories.entry(sender_key.to_string()).or_default();
-    turns.push(turn);
-    while turns.len() > MAX_CHANNEL_HISTORY {
-        turns.remove(0);
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(sender_key);
+
+    if already_loaded {
+        return;
     }
+
+    match ctx.memory.load_conversation_history(sender_key).await {
+        Ok(Some(mut messages)) => {
+            // Respect MAX_CHANNEL_HISTORY cap
+            if messages.len() > MAX_CHANNEL_HISTORY {
+                let start = messages.len() - MAX_CHANNEL_HISTORY;
+                messages = messages.split_off(start);
+            }
+            tracing::info!(
+                key = sender_key,
+                count = messages.len(),
+                "Restored conversation history from SQLite"
+            );
+            ctx.conversation_histories
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(sender_key.to_string(), messages);
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!("Failed to load conversation history from SQLite: {e}");
+        }
+    }
+}
+
+fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatMessage) {
+    let snapshot = {
+        let mut histories = ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let turns = histories.entry(sender_key.to_string()).or_default();
+        turns.push(turn);
+        while turns.len() > MAX_CHANNEL_HISTORY {
+            turns.remove(0);
+        }
+        turns.clone()
+    };
+
+    // Async write-through: persist to SQLite
+    let memory = Arc::clone(&ctx.memory);
+    let key = sender_key.to_string();
+    tokio::spawn(async move {
+        if let Err(e) = memory.save_conversation_history(&key, &snapshot).await {
+            tracing::warn!("Failed to persist conversation history: {e}");
+        }
+    });
 }
 
 fn rollback_orphan_user_turn(
@@ -1581,6 +1655,10 @@ async fn process_channel_message(
     }
 
     let history_key = conversation_history_key(&msg);
+
+    // Lazy-load persisted conversation history on first access after startup
+    load_sender_history_if_needed(ctx.as_ref(), &history_key).await;
+
     let route = get_route_selection(ctx.as_ref(), &history_key);
     let runtime_defaults = runtime_defaults_snapshot(ctx.as_ref());
     let active_provider = match get_or_create_provider(ctx.as_ref(), &route.provider).await {

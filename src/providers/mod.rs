@@ -1282,12 +1282,11 @@ fn create_provider_with_url_and_options(
                 "Custom provider",
                 "custom:https://your-api.com",
             )?;
-            Ok(Box::new(OpenAiCompatibleProvider::new_with_vision(
+            Ok(Box::new(OpenAiCompatibleProvider::new_no_responses_fallback(
                 "Custom",
                 &base_url,
                 key,
                 AuthStyle::Bearer,
-                true,
             )))
         }
 

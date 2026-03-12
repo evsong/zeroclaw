@@ -772,7 +772,7 @@ impl Channel for DiscordChannel {
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs(),
-                        thread_ts: None,
+                        thread_ts: Some(channel_id.clone()),
                     };
 
                     if tx.send(channel_msg).await.is_err() {
