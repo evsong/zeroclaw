@@ -470,17 +470,18 @@ impl SqliteMemory {
         let conn = self.conn.clone();
         let key = key.to_string();
 
-        tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Vec<crate::providers::ChatMessage>>> {
-            let conn = conn.lock();
-            let mut stmt = conn.prepare(
-                "SELECT messages FROM conversation_history WHERE history_key = ?1",
-            )?;
-            let mut rows = stmt.query_map(params![key], |row| row.get::<_, String>(0))?;
-            match rows.next() {
-                Some(Ok(json)) => Ok(Some(serde_json::from_str(&json)?)),
-                _ => Ok(None),
-            }
-        })
+        tokio::task::spawn_blocking(
+            move || -> anyhow::Result<Option<Vec<crate::providers::ChatMessage>>> {
+                let conn = conn.lock();
+                let mut stmt = conn
+                    .prepare("SELECT messages FROM conversation_history WHERE history_key = ?1")?;
+                let mut rows = stmt.query_map(params![key], |row| row.get::<_, String>(0))?;
+                match rows.next() {
+                    Some(Ok(json)) => Ok(Some(serde_json::from_str(&json)?)),
+                    _ => Ok(None),
+                }
+            },
+        )
         .await?
     }
 

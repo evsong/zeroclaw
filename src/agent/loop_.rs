@@ -8,7 +8,7 @@ use crate::providers::{
 };
 use crate::runtime;
 use crate::security::SecurityPolicy;
-use crate::tools::{self, Tool};
+use crate::tools::{self, Tool, ToolExecutionContext};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use regex::{Regex, RegexSet};
@@ -1891,6 +1891,7 @@ pub(crate) async fn agent_turn(
         None,
         None,
         &[],
+        None,
     )
     .await
 }
@@ -1900,6 +1901,7 @@ async fn execute_one_tool(
     call_arguments: serde_json::Value,
     tools_registry: &[Box<dyn Tool>],
     observer: &dyn Observer,
+    tool_context: Option<ToolExecutionContext>,
     cancellation_token: Option<&CancellationToken>,
 ) -> Result<ToolExecutionOutcome> {
     observer.record_event(&ObserverEvent::ToolCallStart {
@@ -1923,7 +1925,7 @@ async fn execute_one_tool(
         });
     };
 
-    let tool_future = tool.execute(call_arguments);
+    let tool_future = tool.execute_with_context(call_arguments, tool_context);
     let tool_result = if let Some(token) = cancellation_token {
         tokio::select! {
             () = token.cancelled() => return Err(ToolLoopCancelled.into()),
@@ -2006,6 +2008,7 @@ async fn execute_tools_parallel(
     tool_calls: &[ParsedToolCall],
     tools_registry: &[Box<dyn Tool>],
     observer: &dyn Observer,
+    tool_context: Option<ToolExecutionContext>,
     cancellation_token: Option<&CancellationToken>,
 ) -> Result<Vec<ToolExecutionOutcome>> {
     let futures: Vec<_> = tool_calls
@@ -2016,6 +2019,7 @@ async fn execute_tools_parallel(
                 call.arguments.clone(),
                 tools_registry,
                 observer,
+                tool_context.clone(),
                 cancellation_token,
             )
         })
@@ -2029,6 +2033,7 @@ async fn execute_tools_sequential(
     tool_calls: &[ParsedToolCall],
     tools_registry: &[Box<dyn Tool>],
     observer: &dyn Observer,
+    tool_context: Option<ToolExecutionContext>,
     cancellation_token: Option<&CancellationToken>,
 ) -> Result<Vec<ToolExecutionOutcome>> {
     let mut outcomes = Vec::with_capacity(tool_calls.len());
@@ -2040,6 +2045,7 @@ async fn execute_tools_sequential(
                 call.arguments.clone(),
                 tools_registry,
                 observer,
+                tool_context.clone(),
                 cancellation_token,
             )
             .await?,
@@ -2081,6 +2087,7 @@ pub(crate) async fn run_tool_call_loop(
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
     hooks: Option<&crate::hooks::HookRunner>,
     excluded_tools: &[String],
+    tool_context: Option<ToolExecutionContext>,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -2564,6 +2571,7 @@ pub(crate) async fn run_tool_call_loop(
                 &executable_calls,
                 tools_registry,
                 observer,
+                tool_context.clone(),
                 cancellation_token.as_ref(),
             )
             .await?
@@ -2572,6 +2580,7 @@ pub(crate) async fn run_tool_call_loop(
                 &executable_calls,
                 tools_registry,
                 observer,
+                tool_context.clone(),
                 cancellation_token.as_ref(),
             )
             .await?
@@ -3035,6 +3044,7 @@ pub async fn run(
             None,
             None,
             &[],
+            None,
         )
         .await?;
         final_output = response.clone();
@@ -3157,6 +3167,7 @@ pub async fn run(
                 None,
                 None,
                 &[],
+                None,
             )
             .await
             {
@@ -3701,6 +3712,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -3747,6 +3759,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect_err("oversized payload must fail");
@@ -3787,6 +3800,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect("valid multimodal payload should pass");
@@ -3913,6 +3927,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect("parallel execution should complete");
@@ -3982,6 +3997,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect("loop should finish after deduplicating repeated calls");
@@ -4038,6 +4054,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect("native fallback id flow should complete");

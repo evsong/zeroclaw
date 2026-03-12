@@ -437,7 +437,7 @@ Every subsystem is a **trait** — swap implementations with a config change, ze
 | **AI Models**     | `Provider`       | Provider catalog via `zeroclaw providers` (built-ins + aliases, plus custom endpoints)                                                                                     | `custom:https://your-api.com` (OpenAI-compatible) or `anthropic-custom:https://your-api.com` |
 | **Channels**      | `Channel`        | CLI, Telegram, Discord, Slack, Mattermost, iMessage, Matrix, Signal, WhatsApp, Linq, Email, IRC, Lark, DingTalk, QQ, Nostr, Webhook                                        | Any messaging API                                                                            |
 | **Memory**        | `Memory`         | SQLite hybrid search, PostgreSQL backend (configurable storage provider), Lucid bridge, Markdown files, explicit `none` backend, snapshot/hydrate, optional response cache | Any persistence backend                                                                      |
-| **Tools**         | `Tool`           | shell/file/memory, cron/schedule, git, pushover, browser, http_request, screenshot/image_info, composio (opt-in), delegate, hardware tools                                 | Any capability                                                                               |
+| **Tools**         | `Tool`           | shell/file/apply_patch, memory, cron/schedule, process, git, pushover, browser, http_request/web_fetch, screenshot/image_info, composio (opt-in), delegate/child_session, hardware tools | Any capability                                                                               |
 | **Observability** | `Observer`       | Noop, Log, Multi                                                                                                                                                           | Prometheus, OTel                                                                             |
 | **Runtime**       | `RuntimeAdapter` | Native, Docker (sandboxed)                                                                                                                                                 | Additional runtimes can be added via adapter; unsupported kinds fail fast                    |
 | **Security**      | `SecurityPolicy` | Gateway pairing, sandbox, allowlists, rate limits, filesystem scoping, encrypted secrets                                                                                   | —                                                                                            |
@@ -446,6 +446,15 @@ Every subsystem is a **trait** — swap implementations with a config change, ze
 | **Heartbeat**     | Engine           | HEARTBEAT.md periodic tasks                                                                                                                                                | —                                                                                            |
 | **Skills**        | Loader           | TOML manifests + SKILL.md instructions                                                                                                                                     | Community skill packs                                                                        |
 | **Integrations**  | Registry         | 70+ integrations across 9 categories                                                                                                                                       | Plugin system                                                                                |
+
+### High-impact tool guidance
+
+- `url_prefetch` is meant for direct text links such as gist/raw GitHub URLs. It is not a generic browsing feature.
+- `apply_patch` is the preferred way to express a single structured multi-file code edit when plain `file_edit` would be brittle.
+- `process` is for long-running shell work that needs polling, logs, or stdin. Use plain `shell` for short one-shot commands.
+- `child_session` is for bounded async delegation with a summary handoff, not persistent sub-agent graphs.
+
+Operator defaults and rollback guidance live in [docs/ops/operations-runbook.md](docs/ops/operations-runbook.md) and [docs/reference/api/config-reference.md](docs/reference/api/config-reference.md).
 
 ### Runtime support (current)
 

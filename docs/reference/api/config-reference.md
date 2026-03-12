@@ -156,6 +156,8 @@ Notes:
 - `agentic = false` preserves existing single prompt→response delegate behavior.
 - `agentic = true` requires at least one matching entry in `allowed_tools`.
 - The `delegate` tool is excluded from sub-agent allowlists to prevent re-entrant delegation loops.
+- The `child_session` tool reuses these same agent definitions for bounded asynchronous delegated runs, so model, tool allowlist, depth limit, and max-iteration budget all come from `[agents.<name>]`.
+- `child_session` is excluded from non-CLI channels by default; enable it explicitly if you want delegated background work in public messaging channels.
 
 ```toml
 [agents.researcher]
@@ -336,6 +338,7 @@ Notes:
 | `block_high_risk_commands` | `true` | hard block for high-risk commands |
 | `auto_approve` | `[]` | tool operations always auto-approved |
 | `always_ask` | `[]` | tool operations that always require approval |
+| `non_cli_excluded_tools` | `["apply_patch", "process", "child_session"]` | tools hidden from non-CLI channels unless operators opt in |
 
 Notes:
 
@@ -345,12 +348,37 @@ Notes:
 - `allowed_commands` entries can be command names (for example, `"git"`), explicit executable paths (for example, `"/usr/bin/antigravity"`), or `"*"` to allow any command name/path (risk gates still apply).
 - Shell separator/operator parsing is quote-aware. Characters like `;` inside quoted arguments are treated as literals, not command separators.
 - Unquoted shell chaining/operators are still enforced by policy checks (`;`, `|`, `&&`, `||`, background chaining, and redirects).
+- `non_cli_excluded_tools` defaults to keeping higher-impact coding/ops tools out of Discord/Feishu-style channels until production behavior is validated.
 
 ```toml
 [autonomy]
 workspace_only = false
 forbidden_paths = ["/etc", "/root", "/proc", "/sys", "~/.ssh", "~/.gnupg", "~/.aws"]
 allowed_roots = ["~/Desktop/projects", "/opt/shared-repo"]
+```
+
+## `[url_prefetch]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `false` | enable deterministic direct-content URL prefetch before answer generation |
+| `allowed_domains` | `["gist.githubusercontent.com", "raw.githubusercontent.com"]` | direct-content hosts eligible for deterministic prefetch |
+| `fetch_intent_keywords` | built-in multilingual list | phrases that mean “read the linked content first” |
+| `max_response_size` | `25000` | cap prefetched body size per request in bytes |
+| `timeout_secs` | `20` | network timeout for the prefetch request |
+
+Notes:
+
+- This path is narrower than `web_fetch`: it is for direct text payloads such as gist/raw GitHub URLs, not arbitrary webpages.
+- Prefetch content is injected into the current turn only; the fetched body is not written back into long-term conversation history.
+- Keep `allowed_domains` tight. If production behavior becomes noisy or unsafe, disable the feature with `enabled = false` first.
+
+```toml
+[url_prefetch]
+enabled = true
+allowed_domains = ["gist.githubusercontent.com", "raw.githubusercontent.com"]
+max_response_size = 25000
+timeout_secs = 20
 ```
 
 ## `[memory]`

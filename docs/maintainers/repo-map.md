@@ -101,11 +101,11 @@ Channels: `telegram` (4.6k), `discord`, `slack`, `whatsapp`, `whatsapp_web`, `ma
 | `tools/` | `traits.rs`, `mod.rs` (635), + 38 tool files | **What the agent can do.** `Tool` trait: `name()`, `description()`, `parameters_schema()`, `execute()`. Two registries: `default_tools()` (6 essentials) and `all_tools_with_runtime()` (full set, config-gated). |
 
 Tool categories:
-- **File/Shell**: `shell`, `file_read`, `file_write`, `file_edit`, `glob_search`, `content_search`
+- **File/Shell**: `shell`, `file_read`, `file_write`, `file_edit`, `apply_patch`, `glob_search`, `content_search`, `process`
 - **Memory**: `memory_store`, `memory_recall`, `memory_forget`
 - **Web**: `browser`, `browser_open`, `web_fetch`, `web_search_tool`, `http_request`
 - **Scheduling**: `cron_add`, `cron_list`, `cron_remove`, `cron_update`, `cron_run`, `cron_runs`, `schedule`
-- **Delegation**: `delegate` (sub-agent spawning), `composio` (OAuth integrations)
+- **Delegation**: `delegate` (inline sub-agent runs), `child_session` (bounded async delegated runs), `composio` (OAuth integrations)
 - **Hardware**: `hardware_board_info`, `hardware_memory_map`, `hardware_memory_read`
 - **SOP**: `sop_execute`, `sop_advance`, `sop_approve`, `sop_list`, `sop_status`
 - **Utility**: `git_operations`, `image_info`, `pdf_read`, `screenshot`, `pushover`, `model_routing_config`, `proxy_config`, `cli_discovery`, `schema`

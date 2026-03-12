@@ -186,6 +186,10 @@ pub struct Config {
     #[serde(default)]
     pub web_fetch: WebFetchConfig,
 
+    /// Deterministic direct-content URL prefetch configuration (`[url_prefetch]`).
+    #[serde(default)]
+    pub url_prefetch: UrlPrefetchConfig,
+
     /// Web search tool configuration (`[web_search]`).
     #[serde(default)]
     pub web_search: WebSearchConfig,
@@ -1267,6 +1271,84 @@ impl Default for WebFetchConfig {
     }
 }
 
+// ── Deterministic URL prefetch ───────────────────────────────────
+
+/// Deterministic prefetch configuration for direct-content URLs (`[url_prefetch]` section).
+///
+/// This is intentionally narrower than `web_fetch`: it is meant for links that are
+/// already direct text content, such as GitHub raw URLs or gist raw endpoints.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct UrlPrefetchConfig {
+    /// Enable deterministic URL prefetch before answer generation.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Allowed direct-content domains for deterministic prefetch.
+    #[serde(default = "default_url_prefetch_allowed_domains")]
+    pub allowed_domains: Vec<String>,
+    /// Keywords that indicate the user wants the linked content fetched and inspected.
+    #[serde(default = "default_url_prefetch_intent_keywords")]
+    pub fetch_intent_keywords: Vec<String>,
+    /// Maximum prefetched response size in bytes (0 = unlimited).
+    #[serde(default = "default_url_prefetch_max_response_size")]
+    pub max_response_size: usize,
+    /// Request timeout in seconds.
+    #[serde(default = "default_url_prefetch_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+fn default_url_prefetch_allowed_domains() -> Vec<String> {
+    vec![
+        "gist.githubusercontent.com".to_string(),
+        "raw.githubusercontent.com".to_string(),
+    ]
+}
+
+fn default_url_prefetch_intent_keywords() -> Vec<String> {
+    vec![
+        "read",
+        "inspect",
+        "summarize",
+        "summary",
+        "analyze",
+        "analyse",
+        "check",
+        "review",
+        "look at",
+        "look into",
+        "看下",
+        "看看",
+        "读一下",
+        "读取",
+        "总结",
+        "概括",
+        "分析",
+        "检查",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+fn default_url_prefetch_max_response_size() -> usize {
+    25_000
+}
+
+fn default_url_prefetch_timeout_secs() -> u64 {
+    20
+}
+
+impl Default for UrlPrefetchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allowed_domains: default_url_prefetch_allowed_domains(),
+            fetch_intent_keywords: default_url_prefetch_intent_keywords(),
+            max_response_size: default_url_prefetch_max_response_size(),
+            timeout_secs: default_url_prefetch_timeout_secs(),
+        }
+    }
+}
+
 // ── Web search ───────────────────────────────────────────────────
 
 /// Web search tool configuration (`[web_search]` section).
@@ -2175,7 +2257,7 @@ pub struct AutonomyConfig {
     ///
     /// When a tool is listed here, non-CLI channels will not expose it to the
     /// model in tool specs.
-    #[serde(default)]
+    #[serde(default = "default_non_cli_excluded_tools")]
     pub non_cli_excluded_tools: Vec<String>,
 }
 
@@ -2185,6 +2267,14 @@ fn default_auto_approve() -> Vec<String> {
 
 fn default_always_ask() -> Vec<String> {
     vec![]
+}
+
+fn default_non_cli_excluded_tools() -> Vec<String> {
+    vec![
+        "apply_patch".into(),
+        "process".into(),
+        "child_session".into(),
+    ]
 }
 
 fn is_valid_env_var_name(name: &str) -> bool {
@@ -2244,7 +2334,7 @@ impl Default for AutonomyConfig {
             auto_approve: default_auto_approve(),
             always_ask: default_always_ask(),
             allowed_roots: Vec::new(),
-            non_cli_excluded_tools: Vec::new(),
+            non_cli_excluded_tools: default_non_cli_excluded_tools(),
         }
     }
 }
@@ -3785,6 +3875,7 @@ impl Default for Config {
             http_request: HttpRequestConfig::default(),
             multimodal: MultimodalConfig::default(),
             web_fetch: WebFetchConfig::default(),
+            url_prefetch: UrlPrefetchConfig::default(),
             web_search: WebSearchConfig::default(),
             proxy: ProxyConfig::default(),
             identity: IdentityConfig::default(),
@@ -5067,6 +5158,22 @@ mod tests {
     }
 
     #[test]
+    async fn url_prefetch_config_default_has_correct_values() {
+        let cfg = UrlPrefetchConfig::default();
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.timeout_secs, 20);
+        assert_eq!(cfg.max_response_size, 25_000);
+        assert!(cfg
+            .allowed_domains
+            .contains(&"gist.githubusercontent.com".to_string()));
+        assert!(cfg
+            .allowed_domains
+            .contains(&"raw.githubusercontent.com".to_string()));
+        assert!(cfg.fetch_intent_keywords.iter().any(|kw| kw == "看下"));
+        assert!(cfg.fetch_intent_keywords.iter().any(|kw| kw == "inspect"));
+    }
+
+    #[test]
     async fn config_default_has_sane_values() {
         let c = Config::default();
         assert_eq!(c.default_provider.as_deref(), Some("openrouter"));
@@ -5269,6 +5376,20 @@ default_temperature = 0.7
         assert!(c.discord.is_none());
     }
 
+    #[test]
+    async fn autonomy_defaults_exclude_process_controls_from_non_cli_channels() {
+        let autonomy = AutonomyConfig::default();
+        assert!(autonomy
+            .non_cli_excluded_tools
+            .contains(&"apply_patch".to_string()));
+        assert!(autonomy
+            .non_cli_excluded_tools
+            .contains(&"process".to_string()));
+        assert!(autonomy
+            .non_cli_excluded_tools
+            .contains(&"child_session".to_string()));
+    }
+
     // ── Serde round-trip ─────────────────────────────────────
 
     #[test]
@@ -5361,6 +5482,7 @@ default_temperature = 0.7
             http_request: HttpRequestConfig::default(),
             multimodal: MultimodalConfig::default(),
             web_fetch: WebFetchConfig::default(),
+            url_prefetch: UrlPrefetchConfig::default(),
             web_search: WebSearchConfig::default(),
             proxy: ProxyConfig::default(),
             agent: AgentConfig::default(),
@@ -5544,6 +5666,7 @@ tool_dispatcher = "xml"
             http_request: HttpRequestConfig::default(),
             multimodal: MultimodalConfig::default(),
             web_fetch: WebFetchConfig::default(),
+            url_prefetch: UrlPrefetchConfig::default(),
             web_search: WebSearchConfig::default(),
             proxy: ProxyConfig::default(),
             agent: AgentConfig::default(),

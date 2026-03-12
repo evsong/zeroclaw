@@ -81,6 +81,8 @@ use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
+use futures_util::StreamExt;
+use regex::Regex;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
@@ -125,6 +127,10 @@ const CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES: usize = 12;
 const CHANNEL_HISTORY_COMPACT_CONTENT_CHARS: usize = 600;
 /// Guardrail for hook-modified outbound channel content.
 const CHANNEL_HOOK_MAX_OUTBOUND_CHARS: usize = 20_000;
+const URL_PREFETCH_ANCHOR_MAX_CHARS: usize = 200;
+const URL_PREFETCH_MAX_REDIRECTS: usize = 10;
+const URL_PREFETCH_DIRECT_CONTENT_HOSTS: [&str; 2] =
+    ["gist.githubusercontent.com", "raw.githubusercontent.com"];
 
 type ProviderCacheMap = Arc<Mutex<HashMap<String, Arc<dyn Provider>>>>;
 type RouteSelectionMap = Arc<Mutex<HashMap<String, ChannelRouteSelection>>>;
@@ -225,8 +231,208 @@ struct ChannelRuntimeContext {
     message_timeout_secs: u64,
     interrupt_on_new_message: bool,
     multimodal: crate::config::MultimodalConfig,
+    url_prefetch: Arc<crate::config::UrlPrefetchConfig>,
+    url_prefetcher: Arc<dyn UrlPrefetcher>,
     hooks: Option<Arc<crate::hooks::HookRunner>>,
     non_cli_excluded_tools: Arc<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UrlPrefetchOutcome {
+    Success(UrlPrefetchSuccess),
+    Failure(UrlPrefetchFailure),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UrlPrefetchSuccess {
+    content_type: String,
+    body: String,
+    anchor: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UrlPrefetchFailure {
+    category: String,
+    reason: String,
+}
+
+#[async_trait::async_trait]
+trait UrlPrefetcher: Send + Sync {
+    async fn fetch(
+        &self,
+        url: &str,
+        config: &crate::config::UrlPrefetchConfig,
+    ) -> UrlPrefetchOutcome;
+}
+
+struct HttpUrlPrefetcher;
+
+#[async_trait::async_trait]
+impl UrlPrefetcher for HttpUrlPrefetcher {
+    async fn fetch(
+        &self,
+        url: &str,
+        config: &crate::config::UrlPrefetchConfig,
+    ) -> UrlPrefetchOutcome {
+        let allowed_domains =
+            crate::tools::web_fetch::normalize_allowed_domains(config.allowed_domains.clone());
+        let validated = match crate::tools::web_fetch::validate_target_url(
+            url,
+            &allowed_domains,
+            &[],
+            "url_prefetch",
+        ) {
+            Ok(url) => url,
+            Err(error) => {
+                return UrlPrefetchOutcome::Failure(UrlPrefetchFailure {
+                    category: "policy".to_string(),
+                    reason: error.to_string(),
+                });
+            }
+        };
+
+        let timeout_secs = if config.timeout_secs == 0 {
+            tracing::warn!("url_prefetch: timeout_secs is 0, using safe default of 20s");
+            20
+        } else {
+            config.timeout_secs
+        };
+
+        let redirect_allowed_domains = allowed_domains.clone();
+        let redirect_policy = reqwest::redirect::Policy::custom(move |attempt| {
+            if attempt.previous().len() >= URL_PREFETCH_MAX_REDIRECTS {
+                return attempt.error(std::io::Error::other(format!(
+                    "Too many redirects (max {URL_PREFETCH_MAX_REDIRECTS})"
+                )));
+            }
+
+            if let Err(error) = crate::tools::web_fetch::validate_target_url(
+                attempt.url().as_str(),
+                &redirect_allowed_domains,
+                &[],
+                "url_prefetch",
+            ) {
+                return attempt.error(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("Blocked redirect target: {error}"),
+                ));
+            }
+
+            attempt.follow()
+        });
+
+        let builder = reqwest::Client::builder()
+            .timeout(Duration::from_secs(timeout_secs))
+            .connect_timeout(Duration::from_secs(10))
+            .redirect(redirect_policy)
+            .user_agent("ZeroClaw/0.1 (url_prefetch)");
+        let builder = crate::config::apply_runtime_proxy_to_builder(builder, "tool.web_fetch");
+        let client = match builder.build() {
+            Ok(client) => client,
+            Err(error) => {
+                return UrlPrefetchOutcome::Failure(UrlPrefetchFailure {
+                    category: "client".to_string(),
+                    reason: format!("Failed to build HTTP client: {error}"),
+                });
+            }
+        };
+
+        let response = match client.get(&validated).send().await {
+            Err(error) if error.is_timeout() => {
+                return UrlPrefetchOutcome::Failure(UrlPrefetchFailure {
+                    category: "timeout".to_string(),
+                    reason: format!("Timed out after {timeout_secs}s"),
+                });
+            }
+            Ok(response) => response,
+            Err(error) => {
+                return UrlPrefetchOutcome::Failure(UrlPrefetchFailure {
+                    category: "network".to_string(),
+                    reason: format!("HTTP request failed: {error}"),
+                });
+            }
+        };
+
+        let status = response.status();
+        if !status.is_success() {
+            return UrlPrefetchOutcome::Failure(UrlPrefetchFailure {
+                category: "http".to_string(),
+                reason: format!(
+                    "HTTP {} {}",
+                    status.as_u16(),
+                    status.canonical_reason().unwrap_or("Unknown")
+                ),
+            });
+        }
+
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_lowercase();
+
+        if !is_supported_prefetch_content_type(&content_type) {
+            return UrlPrefetchOutcome::Failure(UrlPrefetchFailure {
+                category: "content_type".to_string(),
+                reason: format!(
+                    "Unsupported content type for deterministic prefetch: {}",
+                    if content_type.is_empty() {
+                        "<empty>"
+                    } else {
+                        &content_type
+                    }
+                ),
+            });
+        }
+
+        let hard_cap = if config.max_response_size == 0 {
+            usize::MAX
+        } else {
+            config.max_response_size.saturating_add(1)
+        };
+        let mut bytes = Vec::new();
+        let mut bytes_stream = response.bytes_stream();
+        while let Some(chunk_result) = bytes_stream.next().await {
+            let chunk = match chunk_result {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    return UrlPrefetchOutcome::Failure(UrlPrefetchFailure {
+                        category: "network".to_string(),
+                        reason: format!("Failed to read response body: {error}"),
+                    });
+                }
+            };
+
+            if config.max_response_size == 0 {
+                bytes.extend_from_slice(&chunk);
+                continue;
+            }
+
+            if crate::tools::web_fetch::append_chunk_with_cap(&mut bytes, &chunk, hard_cap) {
+                break;
+            }
+        }
+
+        if config.max_response_size != 0 && bytes.len() > config.max_response_size {
+            return UrlPrefetchOutcome::Failure(UrlPrefetchFailure {
+                category: "response_size".to_string(),
+                reason: format!(
+                    "Response exceeded url_prefetch.max_response_size ({} bytes)",
+                    config.max_response_size
+                ),
+            });
+        }
+
+        let body = String::from_utf8_lossy(&bytes).into_owned();
+        let anchor = extract_prefetch_anchor(&body);
+
+        UrlPrefetchOutcome::Success(UrlPrefetchSuccess {
+            content_type,
+            body,
+            anchor,
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -1602,6 +1808,177 @@ fn spawn_scoped_typing_task(
     handle
 }
 
+fn url_prefetch_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"https?://[^\s<>()]+").expect("valid URL regex"))
+}
+
+fn trim_url_candidate(raw: &str) -> &str {
+    raw.trim_end_matches(|ch: char| {
+        matches!(
+            ch,
+            ')' | ']'
+                | '}'
+                | '>'
+                | '.'
+                | ','
+                | '!'
+                | '?'
+                | ';'
+                | ':'
+                | '，'
+                | '。'
+                | '！'
+                | '？'
+                | '；'
+                | '：'
+        )
+    })
+}
+
+fn is_supported_prefetch_content_type(content_type: &str) -> bool {
+    content_type.is_empty()
+        || content_type.contains("text/plain")
+        || content_type.contains("text/markdown")
+        || content_type.contains("application/json")
+}
+
+fn extract_prefetch_anchor(body: &str) -> String {
+    let anchor = body
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .or_else(|| {
+            let trimmed = body.trim();
+            (!trimmed.is_empty()).then_some(trimmed)
+        })
+        .unwrap_or("[empty content]");
+
+    truncate_with_ellipsis(anchor, URL_PREFETCH_ANCHOR_MAX_CHARS)
+}
+
+fn contains_fetch_intent(message: &str, keywords: &[String]) -> bool {
+    let lowered = message.to_lowercase();
+    keywords
+        .iter()
+        .map(|keyword| keyword.trim())
+        .filter(|keyword| !keyword.is_empty())
+        .any(|keyword| lowered.contains(&keyword.to_lowercase()))
+}
+
+fn is_supported_prefetch_host(host: &str, allowed_domains: &[String]) -> bool {
+    URL_PREFETCH_DIRECT_CONTENT_HOSTS.contains(&host)
+        && crate::tools::web_fetch::host_matches_allowlist(host, allowed_domains)
+}
+
+fn extract_prefetch_candidate_url(
+    message: &str,
+    config: &crate::config::UrlPrefetchConfig,
+) -> Option<String> {
+    if !config.enabled || !contains_fetch_intent(message, &config.fetch_intent_keywords) {
+        return None;
+    }
+
+    let allowed_domains =
+        crate::tools::web_fetch::normalize_allowed_domains(config.allowed_domains.clone());
+    if allowed_domains.is_empty() {
+        return None;
+    }
+
+    url_prefetch_regex()
+        .find_iter(message)
+        .filter_map(|matched| {
+            let url = trim_url_candidate(matched.as_str());
+            (!url.is_empty()).then_some(url)
+        })
+        .find_map(|url| {
+            let host = crate::tools::web_fetch::extract_host(url).ok()?;
+            is_supported_prefetch_host(&host, &allowed_domains).then(|| url.to_string())
+        })
+}
+
+fn build_prefetch_context_block(url: &str, outcome: &UrlPrefetchOutcome) -> String {
+    match outcome {
+        UrlPrefetchOutcome::Success(success) => format!(
+            "[URL prefetch]\nsource: {url}\nstatus: success\ncontent_type: {}\nanchor: {}\ncontent:\n{}\n[/URL prefetch]\n\n",
+            if success.content_type.is_empty() {
+                "text/plain"
+            } else {
+                success.content_type.as_str()
+            },
+            success.anchor,
+            success.body
+        ),
+        UrlPrefetchOutcome::Failure(failure) => format!(
+            "[URL prefetch]\nsource: {url}\nstatus: failed\ncategory: {}\nreason: {}\n[/URL prefetch]\n\n",
+            failure.category, failure.reason
+        ),
+    }
+}
+
+async fn maybe_build_prefetch_context(
+    ctx: &ChannelRuntimeContext,
+    msg: &traits::ChannelMessage,
+) -> Option<String> {
+    let url = extract_prefetch_candidate_url(&msg.content, ctx.url_prefetch.as_ref())?;
+    tracing::info!(channel = %msg.channel, %url, "Deterministic URL prefetch triggered");
+
+    let outcome = ctx
+        .url_prefetcher
+        .fetch(&url, ctx.url_prefetch.as_ref())
+        .await;
+
+    match &outcome {
+        UrlPrefetchOutcome::Success(success) => {
+            tracing::info!(
+                channel = %msg.channel,
+                %url,
+                anchor = %success.anchor,
+                content_type = %success.content_type,
+                "Deterministic URL prefetch succeeded"
+            );
+            runtime_trace::record_event(
+                "url_prefetch",
+                Some(msg.channel.as_str()),
+                None,
+                None,
+                None,
+                Some(true),
+                None,
+                serde_json::json!({
+                    "url": url,
+                    "anchor": success.anchor,
+                    "content_type": success.content_type,
+                }),
+            );
+        }
+        UrlPrefetchOutcome::Failure(failure) => {
+            tracing::warn!(
+                channel = %msg.channel,
+                %url,
+                category = %failure.category,
+                reason = %failure.reason,
+                "Deterministic URL prefetch failed"
+            );
+            runtime_trace::record_event(
+                "url_prefetch",
+                Some(msg.channel.as_str()),
+                None,
+                None,
+                None,
+                Some(false),
+                Some(failure.reason.as_str()),
+                serde_json::json!({
+                    "url": url,
+                    "category": failure.category,
+                }),
+            );
+        }
+    }
+
+    Some(build_prefetch_context_block(&url, &outcome))
+}
+
 async fn process_channel_message(
     ctx: Arc<ChannelRuntimeContext>,
     msg: traits::ChannelMessage,
@@ -1716,14 +2093,25 @@ async fn process_channel_message(
         .unwrap_or_default();
     let mut prior_turns = normalize_cached_channel_turns(prior_turns_raw);
 
-    // Only enrich with memory context when there is no prior conversation
-    // history. Follow-up turns already include context from previous messages.
+    let prefetch_context = maybe_build_prefetch_context(ctx.as_ref(), &msg).await;
+
+    // Memory recall remains first-turn only, but deterministic URL prefetch
+    // can enrich any turn because it is tied to the current user message.
+    let mut turn_context = String::new();
+    if let Some(prefetch_context) = prefetch_context {
+        turn_context.push_str(&prefetch_context);
+    }
     if !had_prior_history {
         let memory_context =
             build_memory_context(ctx.memory.as_ref(), &msg.content, ctx.min_relevance_score).await;
+        if !memory_context.is_empty() {
+            turn_context.push_str(&memory_context);
+        }
+    }
+    if !turn_context.is_empty() {
         if let Some(last_turn) = prior_turns.last_mut() {
-            if last_turn.role == "user" && !memory_context.is_empty() {
-                last_turn.content = format!("{memory_context}{}", msg.content);
+            if last_turn.role == "user" {
+                last_turn.content = format!("{turn_context}{}", msg.content);
             }
         }
     }
@@ -1855,6 +2243,11 @@ async fn process_channel_message(
                 } else {
                     ctx.non_cli_excluded_tools.as_ref()
                 },
+                Some(crate::tools::ToolExecutionContext {
+                    conversation_key: Some(history_key.clone()),
+                    channel_name: Some(msg.channel.clone()),
+                    reply_target: Some(msg.reply_target.clone()),
+                }),
             ),
         ) => LlmExecutionResult::Completed(result),
     };
@@ -3419,6 +3812,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
         message_timeout_secs,
         interrupt_on_new_message,
         multimodal: config.multimodal.clone(),
+        url_prefetch: Arc::new(config.url_prefetch.clone()),
+        url_prefetcher: Arc::new(HttpUrlPrefetcher),
         hooks: if config.hooks.enabled {
             let mut runner = crate::hooks::HookRunner::new();
             if config.hooks.builtin.command_logger {
@@ -3447,8 +3842,13 @@ mod tests {
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};
     use crate::observability::NoopObserver;
     use crate::providers::{ChatMessage, Provider};
-    use crate::tools::{Tool, ToolResult};
+    use crate::runtime::RuntimeAdapter;
+    use crate::security::{AutonomyLevel, SecurityPolicy};
+    use crate::tools::child_session::ChildSessionRegistry;
+    use crate::tools::process_sessions::ProcessSessionRegistry;
+    use crate::tools::{ApplyPatchTool, ChildSessionTool, ProcessTool, Tool, ToolResult};
     use std::collections::{HashMap, HashSet};
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -3472,6 +3872,484 @@ mod tests {
         .unwrap();
         std::fs::write(tmp.path().join("MEMORY.md"), "# Memory\nUser likes Rust.").unwrap();
         tmp
+    }
+
+    fn make_channel_runtime(
+        channel: Arc<dyn Channel>,
+        provider: Arc<dyn Provider>,
+        tools_registry: Arc<Vec<Box<dyn Tool>>>,
+        workspace_dir: PathBuf,
+    ) -> Arc<ChannelRuntimeContext> {
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider,
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry,
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(workspace_dir),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            url_prefetch: Arc::new(crate::config::UrlPrefetchConfig::default()),
+            url_prefetcher: Arc::new(HttpUrlPrefetcher),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+        })
+    }
+
+    fn tool_call_payload_for(name: &str, arguments: serde_json::Value) -> String {
+        format!(
+            "<tool_call>\n{}\n</tool_call>",
+            serde_json::json!({
+                "name": name,
+                "arguments": arguments,
+            })
+        )
+    }
+
+    fn extract_tool_result_body(content: &str, tool_name: &str) -> Option<String> {
+        let open_tag = format!(r#"<tool_result name="{tool_name}">"#);
+        let start = content.find(&open_tag)? + open_tag.len();
+        let tail = &content[start..];
+        let end = tail.find("</tool_result>")?;
+        Some(tail[..end].trim().to_string())
+    }
+
+    fn extract_tool_result_json(content: &str, tool_name: &str) -> Option<serde_json::Value> {
+        serde_json::from_str(&extract_tool_result_body(content, tool_name)?).ok()
+    }
+
+    fn latest_tool_result_body(messages: &[ChatMessage], tool_name: &str) -> Option<String> {
+        messages
+            .iter()
+            .rev()
+            .filter(|msg| msg.role == "user" && msg.content.contains("[Tool results]"))
+            .find_map(|msg| extract_tool_result_body(&msg.content, tool_name))
+    }
+
+    fn latest_tool_result_json(
+        messages: &[ChatMessage],
+        tool_name: &str,
+    ) -> Option<serde_json::Value> {
+        messages
+            .iter()
+            .rev()
+            .filter(|msg| msg.role == "user" && msg.content.contains("[Tool results]"))
+            .find_map(|msg| extract_tool_result_json(&msg.content, tool_name))
+    }
+
+    fn full_test_security(workspace_dir: PathBuf) -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir,
+            workspace_only: true,
+            allowed_commands: vec!["python3".into(), "sh".into()],
+            max_actions_per_hour: 50,
+            ..SecurityPolicy::default()
+        })
+    }
+
+    struct ChannelTestRuntime;
+
+    impl RuntimeAdapter for ChannelTestRuntime {
+        fn name(&self) -> &str {
+            "channel-test-runtime"
+        }
+
+        fn has_shell_access(&self) -> bool {
+            true
+        }
+
+        fn has_filesystem_access(&self) -> bool {
+            true
+        }
+
+        fn storage_path(&self) -> PathBuf {
+            std::env::temp_dir().join("zeroclaw-channel-test-runtime")
+        }
+
+        fn supports_long_running(&self) -> bool {
+            true
+        }
+
+        fn build_shell_command(
+            &self,
+            command: &str,
+            workspace_dir: &Path,
+        ) -> anyhow::Result<tokio::process::Command> {
+            let mut process = tokio::process::Command::new("sh");
+            process.arg("-c").arg(command).current_dir(workspace_dir);
+            Ok(process)
+        }
+    }
+
+    struct PrefetchAnswerProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for PrefetchAnswerProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("fallback".to_string())
+        }
+
+        async fn chat_with_history(
+            &self,
+            messages: &[ChatMessage],
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            let prefetched = messages
+                .iter()
+                .find(|msg| msg.role == "user" && msg.content.contains("[URL prefetch]"))
+                .map(|msg| msg.content.clone())
+                .unwrap_or_default();
+            if prefetched.contains("anchor: # Demo Title") {
+                Ok(
+                    "The gist starts with `# Demo Title` and the body begins with `body line`."
+                        .to_string(),
+                )
+            } else {
+                Ok("I did not receive prefetched URL context.".to_string())
+            }
+        }
+    }
+
+    struct ApplyPatchWorkflowProvider {
+        patch: String,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for ApplyPatchWorkflowProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok(tool_call_payload_for(
+                "apply_patch",
+                serde_json::json!({ "patch": self.patch }),
+            ))
+        }
+
+        async fn chat_with_history(
+            &self,
+            messages: &[ChatMessage],
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            let patch_result = latest_tool_result_body(messages, "apply_patch").unwrap_or_default();
+            if patch_result.contains("Applied patch touching") {
+                Ok("Applied the patch and updated the module import to `processor`.".to_string())
+            } else {
+                Ok(tool_call_payload_for(
+                    "apply_patch",
+                    serde_json::json!({ "patch": self.patch }),
+                ))
+            }
+        }
+    }
+
+    struct ProcessWorkflowProvider {
+        session_id: std::sync::Mutex<Option<String>>,
+        first_stdout_offset: std::sync::Mutex<Option<u64>>,
+    }
+
+    impl Default for ProcessWorkflowProvider {
+        fn default() -> Self {
+            Self {
+                session_id: std::sync::Mutex::new(None),
+                first_stdout_offset: std::sync::Mutex::new(None),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for ProcessWorkflowProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok(tool_call_payload_for(
+                "process",
+                serde_json::json!({
+                    "action": "start",
+                    "command": "python3 -c 'import sys,time; print(\"ready\", flush=True); line = sys.stdin.readline().strip(); print(f\"got:{line}\", flush=True); time.sleep(30)'"
+                }),
+            ))
+        }
+
+        async fn chat_with_history(
+            &self,
+            messages: &[ChatMessage],
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            let initial_call = || {
+                tool_call_payload_for(
+                    "process",
+                    serde_json::json!({
+                        "action": "start",
+                        "command": "python3 -c 'import sys,time; print(\"ready\", flush=True); line = sys.stdin.readline().strip(); print(f\"got:{line}\", flush=True); time.sleep(30)'"
+                    }),
+                )
+            };
+
+            if let Some(result) = latest_tool_result_json(messages, "process") {
+                match result["action"].as_str() {
+                    Some("start") => {
+                        let session_id = result["session"]["session_id"]
+                            .as_str()
+                            .expect("start result should include session id")
+                            .to_string();
+                        *self.session_id.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some(session_id.clone());
+                        return Ok(tool_call_payload_for(
+                            "process",
+                            serde_json::json!({
+                                "action": "poll",
+                                "session_id": session_id,
+                                "stdout_offset": 0,
+                                "stderr_offset": 0,
+                            }),
+                        ));
+                    }
+                    Some("poll") => {
+                        let stdout = &result["session"]["stdout"];
+                        let content = stdout["content"].as_str().unwrap_or_default();
+                        let next_offset = stdout["next_offset"].as_u64().unwrap_or(0);
+                        if content.contains("ready\n") {
+                            *self
+                                .first_stdout_offset
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner()) = Some(next_offset);
+                            let session_id = self
+                                .session_id
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .clone()
+                                .expect("session id should exist after start");
+                            return Ok(tool_call_payload_for(
+                                "process",
+                                serde_json::json!({
+                                    "action": "write",
+                                    "session_id": session_id,
+                                    "input": "ping\n",
+                                }),
+                            ));
+                        }
+                        let session_id = self
+                            .session_id
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .clone()
+                            .expect("session id should exist");
+                        return Ok(tool_call_payload_for(
+                            "process",
+                            serde_json::json!({
+                                "action": "kill",
+                                "session_id": session_id,
+                            }),
+                        ));
+                    }
+                    Some("write") => {
+                        let session_id = self
+                            .session_id
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .clone()
+                            .expect("session id should exist");
+                        let stdout_offset = self
+                            .first_stdout_offset
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .expect("first poll should record offset");
+                        return Ok(tool_call_payload_for(
+                            "process",
+                            serde_json::json!({
+                                "action": "poll",
+                                "session_id": session_id,
+                                "stdout_offset": stdout_offset,
+                                "stderr_offset": 0,
+                            }),
+                        ));
+                    }
+                    Some("kill") => {
+                        return Ok(
+                            "Started the background task, polled it twice, wrote stdin once, and terminated it cleanly."
+                                .to_string(),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+
+            if !messages
+                .iter()
+                .any(|msg| msg.role == "user" && msg.content.contains("[Tool results]"))
+            {
+                return Ok(initial_call());
+            }
+
+            Ok(latest_tool_result_body(messages, "process")
+                .filter(|body| body.starts_with("Error:"))
+                .unwrap_or_else(|| {
+                    "Process workflow failed to produce expected tool results.".to_string()
+                }))
+        }
+    }
+
+    struct StubChildDelegateTool;
+
+    #[async_trait::async_trait]
+    impl Tool for StubChildDelegateTool {
+        fn name(&self) -> &str {
+            "delegate"
+        }
+
+        fn description(&self) -> &str {
+            "stub delegate"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object"})
+        }
+
+        async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            self.execute_with_context(args, None).await
+        }
+
+        async fn execute_with_context(
+            &self,
+            _args: serde_json::Value,
+            _context: Option<crate::tools::ToolExecutionContext>,
+        ) -> anyhow::Result<ToolResult> {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            Ok(ToolResult {
+                success: true,
+                output: "Child session finished. Artifact: /tmp/child-report.md".to_string(),
+                error: None,
+            })
+        }
+    }
+
+    struct ChildSessionWorkflowProvider {
+        session_id: std::sync::Mutex<Option<String>>,
+    }
+
+    impl Default for ChildSessionWorkflowProvider {
+        fn default() -> Self {
+            Self {
+                session_id: std::sync::Mutex::new(None),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for ChildSessionWorkflowProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok(tool_call_payload_for(
+                "child_session",
+                serde_json::json!({
+                    "action": "spawn",
+                    "agent": "worker",
+                    "prompt": "Write a short delegated result",
+                    "timeout_secs": 1,
+                }),
+            ))
+        }
+
+        async fn chat_with_history(
+            &self,
+            messages: &[ChatMessage],
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            let initial_call = || {
+                tool_call_payload_for(
+                    "child_session",
+                    serde_json::json!({
+                        "action": "spawn",
+                        "agent": "worker",
+                        "prompt": "Write a short delegated result",
+                        "timeout_secs": 1,
+                    }),
+                )
+            };
+
+            if let Some(result) = latest_tool_result_json(messages, "child_session") {
+                match result["action"].as_str() {
+                    Some("spawn") => {
+                        let session_id = result["session"]["session_id"]
+                            .as_str()
+                            .expect("spawn result should include session id")
+                            .to_string();
+                        *self.session_id.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some(session_id.clone());
+                        return Ok(tool_call_payload_for(
+                            "child_session",
+                            serde_json::json!({
+                                "action": "wait",
+                                "session_id": session_id,
+                                "wait_timeout_secs": 1,
+                            }),
+                        ));
+                    }
+                    Some("wait") => {
+                        if result["session"]["state"] == "completed" {
+                            return Ok(
+                                "Child task completed and handed back its summary to the parent."
+                                    .to_string(),
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            if !messages
+                .iter()
+                .any(|msg| msg.role == "user" && msg.content.contains("[Tool results]"))
+            {
+                return Ok(initial_call());
+            }
+
+            Ok(latest_tool_result_body(messages, "child_session")
+                .filter(|body| body.starts_with("Error:"))
+                .unwrap_or_else(|| "Child session workflow failed to complete.".to_string()))
+        }
     }
 
     #[test]
@@ -3598,8 +4476,8 @@ mod tests {
         assert_eq!(normalized[2].content, "next question");
     }
 
-    #[test]
-    fn compact_sender_history_keeps_recent_truncated_messages() {
+    #[tokio::test]
+    async fn compact_sender_history_keeps_recent_truncated_messages() {
         let mut histories = HashMap::new();
         let sender = "telegram_u1".to_string();
         histories.insert(
@@ -3637,6 +4515,8 @@ mod tests {
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            url_prefetch: Arc::new(crate::config::UrlPrefetchConfig::default()),
+            url_prefetcher: Arc::new(HttpUrlPrefetcher),
             hooks: None,
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -3662,8 +4542,8 @@ mod tests {
         }));
     }
 
-    #[test]
-    fn append_sender_turn_stores_single_turn_per_call() {
+    #[tokio::test]
+    async fn append_sender_turn_stores_single_turn_per_call() {
         let sender = "telegram_u2".to_string();
         let ctx = ChannelRuntimeContext {
             channels_by_name: Arc::new(HashMap::new()),
@@ -3686,6 +4566,8 @@ mod tests {
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            url_prefetch: Arc::new(crate::config::UrlPrefetchConfig::default()),
+            url_prefetcher: Arc::new(HttpUrlPrefetcher),
             hooks: None,
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -3738,6 +4620,8 @@ mod tests {
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            url_prefetch: Arc::new(crate::config::UrlPrefetchConfig::default()),
+            url_prefetcher: Arc::new(HttpUrlPrefetcher),
             hooks: None,
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -4111,6 +4995,55 @@ BTC is currently around $65,000 based on latest tool output."#
         }
     }
 
+    #[derive(Default)]
+    struct StubUrlPrefetcher {
+        calls: std::sync::Mutex<Vec<String>>,
+        outcomes: std::sync::Mutex<HashMap<String, UrlPrefetchOutcome>>,
+    }
+
+    impl StubUrlPrefetcher {
+        fn with_outcome(url: &str, outcome: UrlPrefetchOutcome) -> Self {
+            let mut outcomes = HashMap::new();
+            outcomes.insert(url.to_string(), outcome);
+            Self {
+                calls: std::sync::Mutex::new(Vec::new()),
+                outcomes: std::sync::Mutex::new(outcomes),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl UrlPrefetcher for StubUrlPrefetcher {
+        async fn fetch(
+            &self,
+            url: &str,
+            _config: &crate::config::UrlPrefetchConfig,
+        ) -> UrlPrefetchOutcome {
+            self.calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(url.to_string());
+            self.outcomes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(url)
+                .cloned()
+                .unwrap_or_else(|| {
+                    UrlPrefetchOutcome::Failure(UrlPrefetchFailure {
+                        category: "missing_fixture".to_string(),
+                        reason: format!("no stub outcome registered for {url}"),
+                    })
+                })
+        }
+    }
+
+    fn enabled_url_prefetch_config() -> crate::config::UrlPrefetchConfig {
+        crate::config::UrlPrefetchConfig {
+            enabled: true,
+            ..crate::config::UrlPrefetchConfig::default()
+        }
+    }
+
     struct MockPriceTool;
 
     #[derive(Default)]
@@ -4217,6 +5150,8 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             multimodal: crate::config::MultimodalConfig::default(),
+            url_prefetch: Arc::new(crate::config::UrlPrefetchConfig::default()),
+            url_prefetcher: Arc::new(HttpUrlPrefetcher),
             hooks: None,
         });
 
@@ -4276,6 +5211,8 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             multimodal: crate::config::MultimodalConfig::default(),
+            url_prefetch: Arc::new(crate::config::UrlPrefetchConfig::default()),
+            url_prefetcher: Arc::new(HttpUrlPrefetcher),
             hooks: None,
         });
 
@@ -4348,6 +5285,8 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            url_prefetch: Arc::new(crate::config::UrlPrefetchConfig::default()),
+            url_prefetcher: Arc::new(HttpUrlPrefetcher),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
         });
@@ -4407,6 +5346,8 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            url_prefetch: Arc::new(crate::config::UrlPrefetchConfig::default()),
+            url_prefetcher: Arc::new(HttpUrlPrefetcher),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
         });
@@ -4432,6 +5373,182 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(sent_messages[0].contains("alias-tag flow resolved"));
         assert!(!sent_messages[0].contains("<toolcall>"));
         assert!(!sent_messages[0].contains("mock_price"));
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_runs_apply_patch_workflow_end_to_end() {
+        let workspace = make_workspace();
+        std::fs::create_dir_all(workspace.path().join("src")).unwrap();
+        std::fs::write(
+            workspace.path().join("src/lib.rs"),
+            "mod worker;\n\npub fn run() -> String {\n    worker::handle(\"ready\")\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            workspace.path().join("src/worker.rs"),
+            "pub fn handle(input: &str) -> String {\n    format!(\"handled:{input}\")\n}\n",
+        )
+        .unwrap();
+
+        let patch = "\
+*** Begin Patch
+*** Update File: src/lib.rs
+@@
+-mod worker;
++mod processor;
+ 
+ pub fn run() -> String {
+-    worker::handle(\"ready\")
++    processor::format_status(\"ready\")
+ }
+*** Update File: src/worker.rs
+*** Move to: src/processor.rs
+@@
+-pub fn handle(input: &str) -> String {
+-    format!(\"handled:{input}\")
++pub fn format_status(input: &str) -> String {
++    format!(\"status:{input}\")
+ }
+*** End Patch";
+
+        let security = full_test_security(workspace.path().to_path_buf());
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let runtime_ctx = make_channel_runtime(
+            channel,
+            Arc::new(ApplyPatchWorkflowProvider {
+                patch: patch.to_string(),
+            }),
+            Arc::new(vec![Box::new(ApplyPatchTool::new(security))]),
+            workspace.path().to_path_buf(),
+        );
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-apply-patch".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-apply-patch".to_string(),
+                content: "Refactor worker into processor".to_string(),
+                channel: "test-channel".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent_messages.len(), 1);
+        assert!(sent_messages[0].contains("Applied the patch"));
+        drop(sent_messages);
+
+        let lib_rs = std::fs::read_to_string(workspace.path().join("src/lib.rs")).unwrap();
+        assert_eq!(
+            lib_rs,
+            "mod processor;\n\npub fn run() -> String {\n    processor::format_status(\"ready\")\n}\n"
+        );
+        let processor_rs =
+            std::fs::read_to_string(workspace.path().join("src/processor.rs")).unwrap();
+        assert_eq!(
+            processor_rs,
+            "pub fn format_status(input: &str) -> String {\n    format!(\"status:{input}\")\n}\n"
+        );
+        assert!(!workspace.path().join("src/worker.rs").exists());
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_runs_background_process_workflow_end_to_end() {
+        let workspace = make_workspace();
+        let security = full_test_security(workspace.path().to_path_buf());
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let runtime_ctx = make_channel_runtime(
+            channel,
+            Arc::new(ProcessWorkflowProvider::default()),
+            Arc::new(vec![Box::new(ProcessTool::new(
+                security,
+                Arc::new(ChannelTestRuntime),
+                Arc::new(ProcessSessionRegistry::default()),
+            ))]),
+            workspace.path().to_path_buf(),
+        );
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-process".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-process".to_string(),
+                content: "Start a background process and manage it".to_string(),
+                channel: "test-channel".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent_messages.len(), 1);
+        assert!(sent_messages[0].contains("polled it twice"));
+        assert!(sent_messages[0].contains("terminated it cleanly"));
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_runs_child_session_handoff_end_to_end() {
+        let workspace = make_workspace();
+        let security = full_test_security(workspace.path().to_path_buf());
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut agents = HashMap::new();
+        agents.insert(
+            "worker".to_string(),
+            crate::config::DelegateAgentConfig {
+                provider: "test-provider".to_string(),
+                model: "test-model".to_string(),
+                system_prompt: None,
+                api_key: None,
+                temperature: Some(0.2),
+                max_depth: 2,
+                agentic: true,
+                allowed_tools: vec!["echo_tool".to_string()],
+                max_iterations: 4,
+            },
+        );
+
+        let runtime_ctx = make_channel_runtime(
+            channel,
+            Arc::new(ChildSessionWorkflowProvider::default()),
+            Arc::new(vec![Box::new(ChildSessionTool::new(
+                agents,
+                Arc::new(StubChildDelegateTool),
+                security,
+                Arc::new(ChildSessionRegistry::default()),
+            ))]),
+            workspace.path().to_path_buf(),
+        );
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-child-session".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-child".to_string(),
+                content: "Delegate this work in a bounded child session".to_string(),
+                channel: "test-channel".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent_messages.len(), 1);
+        assert!(sent_messages[0].contains("Child task completed"));
+        assert!(sent_messages[0].contains("parent"));
     }
 
     #[tokio::test]
@@ -4475,6 +5592,8 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            url_prefetch: Arc::new(crate::config::UrlPrefetchConfig::default()),
+            url_prefetcher: Arc::new(HttpUrlPrefetcher),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
         });
@@ -4564,6 +5683,8 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            url_prefetch: Arc::new(crate::config::UrlPrefetchConfig::default()),
+            url_prefetcher: Arc::new(HttpUrlPrefetcher),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
         });
@@ -4635,6 +5756,8 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            url_prefetch: Arc::new(crate::config::UrlPrefetchConfig::default()),
+            url_prefetcher: Arc::new(HttpUrlPrefetcher),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
         });
@@ -4721,6 +5844,8 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            url_prefetch: Arc::new(crate::config::UrlPrefetchConfig::default()),
+            url_prefetcher: Arc::new(HttpUrlPrefetcher),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
         });
@@ -4792,6 +5917,8 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            url_prefetch: Arc::new(crate::config::UrlPrefetchConfig::default()),
+            url_prefetcher: Arc::new(HttpUrlPrefetcher),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
         });
@@ -4852,6 +5979,8 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            url_prefetch: Arc::new(crate::config::UrlPrefetchConfig::default()),
+            url_prefetcher: Arc::new(HttpUrlPrefetcher),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
         });
@@ -5023,6 +6152,8 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            url_prefetch: Arc::new(crate::config::UrlPrefetchConfig::default()),
+            url_prefetcher: Arc::new(HttpUrlPrefetcher),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
         });
@@ -5103,6 +6234,8 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: true,
             multimodal: crate::config::MultimodalConfig::default(),
+            url_prefetch: Arc::new(crate::config::UrlPrefetchConfig::default()),
+            url_prefetcher: Arc::new(HttpUrlPrefetcher),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
         });
@@ -5195,6 +6328,8 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: true,
             multimodal: crate::config::MultimodalConfig::default(),
+            url_prefetch: Arc::new(crate::config::UrlPrefetchConfig::default()),
+            url_prefetcher: Arc::new(HttpUrlPrefetcher),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
         });
@@ -5269,6 +6404,8 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            url_prefetch: Arc::new(crate::config::UrlPrefetchConfig::default()),
+            url_prefetcher: Arc::new(HttpUrlPrefetcher),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
         });
@@ -5328,6 +6465,8 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            url_prefetch: Arc::new(crate::config::UrlPrefetchConfig::default()),
+            url_prefetcher: Arc::new(HttpUrlPrefetcher),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
         });
@@ -5844,6 +6983,8 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            url_prefetch: Arc::new(crate::config::UrlPrefetchConfig::default()),
+            url_prefetcher: Arc::new(HttpUrlPrefetcher),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
         });
@@ -5929,6 +7070,8 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            url_prefetch: Arc::new(crate::config::UrlPrefetchConfig::default()),
+            url_prefetcher: Arc::new(HttpUrlPrefetcher),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
         });
@@ -5969,6 +7112,329 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(turns[0].role, "user");
         assert_eq!(turns[0].content, "hello");
         assert!(!turns[0].content.contains("[Memory context]"));
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_prefetches_supported_direct_content_url_into_current_turn() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(HistoryCaptureProvider::default());
+        let url = "https://gist.githubusercontent.com/evilcos/demo/raw";
+        let prefetcher = Arc::new(StubUrlPrefetcher::with_outcome(
+            url,
+            UrlPrefetchOutcome::Success(UrlPrefetchSuccess {
+                content_type: "text/plain".to_string(),
+                body: "# Demo Title\nbody line".to_string(),
+                anchor: "# Demo Title".to_string(),
+            }),
+        ));
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: provider_impl.clone(),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            url_prefetch: Arc::new(enabled_url_prefetch_config()),
+            url_prefetcher: prefetcher.clone(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+        });
+
+        let original_message = format!("你看下 {url} 这个内容");
+        process_channel_message(
+            runtime_ctx.clone(),
+            traits::ChannelMessage {
+                id: "msg-prefetch-success".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-prefetch".to_string(),
+                content: original_message.clone(),
+                channel: "test-channel".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let calls = provider_impl
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0][1].0, "user");
+        assert!(calls[0][1].1.contains("[URL prefetch]"));
+        assert!(calls[0][1].1.contains("status: success"));
+        assert!(calls[0][1].1.contains("anchor: # Demo Title"));
+        assert!(calls[0][1].1.contains("# Demo Title\nbody line"));
+        assert!(calls[0][1].1.contains(&original_message));
+        drop(calls);
+
+        let prefetch_calls = prefetcher.calls.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(prefetch_calls.as_slice(), &[url.to_string()]);
+        drop(prefetch_calls);
+
+        let histories = runtime_ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let turns = histories
+            .get("test-channel_alice")
+            .expect("history should be stored for sender");
+        assert_eq!(turns[0].role, "user");
+        assert_eq!(turns[0].content, original_message);
+        assert!(!turns[0].content.contains("[URL prefetch]"));
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_prefetch_context_drives_final_answer() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let url = "https://gist.githubusercontent.com/evilcos/demo/raw";
+        let prefetcher = Arc::new(StubUrlPrefetcher::with_outcome(
+            url,
+            UrlPrefetchOutcome::Success(UrlPrefetchSuccess {
+                content_type: "text/plain".to_string(),
+                body: "# Demo Title\nbody line".to_string(),
+                anchor: "# Demo Title".to_string(),
+            }),
+        ));
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(PrefetchAnswerProvider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            url_prefetch: Arc::new(enabled_url_prefetch_config()),
+            url_prefetcher: prefetcher,
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-prefetch-answer".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-prefetch".to_string(),
+                content: format!("你看下 {url} 这个内容"),
+                channel: "test-channel".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent_messages.len(), 1);
+        assert!(sent_messages[0].contains("# Demo Title"));
+        assert!(sent_messages[0].contains("body line"));
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_skips_prefetch_for_unsupported_host() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(HistoryCaptureProvider::default());
+        let prefetcher = Arc::new(StubUrlPrefetcher::default());
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: provider_impl.clone(),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            url_prefetch: Arc::new(enabled_url_prefetch_config()),
+            url_prefetcher: prefetcher.clone(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-prefetch-skip".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-prefetch".to_string(),
+                content: "read https://example.com/report.txt for me".to_string(),
+                channel: "test-channel".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let calls = provider_impl
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0][1].0, "user");
+        assert!(!calls[0][1].1.contains("[URL prefetch]"));
+        drop(calls);
+
+        let prefetch_calls = prefetcher.calls.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            prefetch_calls.is_empty(),
+            "unsupported hosts should be skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_injects_prefetch_failure_into_current_turn() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(HistoryCaptureProvider::default());
+        let url = "https://raw.githubusercontent.com/evilcos/demo/main/README.md";
+        let prefetcher = Arc::new(StubUrlPrefetcher::with_outcome(
+            url,
+            UrlPrefetchOutcome::Failure(UrlPrefetchFailure {
+                category: "response_size".to_string(),
+                reason: "Response exceeded url_prefetch.max_response_size (128 bytes)".to_string(),
+            }),
+        ));
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: provider_impl.clone(),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            url_prefetch: Arc::new(enabled_url_prefetch_config()),
+            url_prefetcher: prefetcher,
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+        });
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            traits::ChannelMessage {
+                id: "msg-prefetch-failure".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-prefetch".to_string(),
+                content: format!("summarize {url}"),
+                channel: "test-channel".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let calls = provider_impl
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0][1].1.contains("[URL prefetch]"));
+        assert!(calls[0][1].1.contains("status: failed"));
+        assert!(calls[0][1].1.contains("category: response_size"));
+        assert!(calls[0][1]
+            .1
+            .contains("Response exceeded url_prefetch.max_response_size"));
+        drop(calls);
+
+        let histories = runtime_ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let turns = histories
+            .get("test-channel_alice")
+            .expect("history should be stored for sender");
+        assert_eq!(turns[0].role, "user");
+        assert_eq!(turns[0].content, format!("summarize {url}"));
+        assert!(!turns[0].content.contains("[URL prefetch]"));
     }
 
     #[tokio::test]
@@ -6014,6 +7480,8 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            url_prefetch: Arc::new(crate::config::UrlPrefetchConfig::default()),
+            url_prefetcher: Arc::new(HttpUrlPrefetcher),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
         });
@@ -6563,6 +8031,8 @@ This is an example JSON object for profile settings."#;
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            url_prefetch: Arc::new(crate::config::UrlPrefetchConfig::default()),
+            url_prefetcher: Arc::new(HttpUrlPrefetcher),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
         });
@@ -6629,6 +8099,8 @@ This is an example JSON object for profile settings."#;
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            url_prefetch: Arc::new(crate::config::UrlPrefetchConfig::default()),
+            url_prefetcher: Arc::new(HttpUrlPrefetcher),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
         });

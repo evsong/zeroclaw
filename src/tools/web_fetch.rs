@@ -266,7 +266,7 @@ impl Tool for WebFetchTool {
 
 // ── Helper functions (independent from http_request.rs per DRY rule-of-three) ──
 
-fn validate_target_url(
+pub(crate) fn validate_target_url(
     raw_url: &str,
     allowed_domains: &[String],
     blocked_domains: &[String],
@@ -312,7 +312,7 @@ fn validate_target_url(
     Ok(url.to_string())
 }
 
-fn append_chunk_with_cap(buffer: &mut Vec<u8>, chunk: &[u8], hard_cap: usize) -> bool {
+pub(crate) fn append_chunk_with_cap(buffer: &mut Vec<u8>, chunk: &[u8], hard_cap: usize) -> bool {
     if buffer.len() >= hard_cap {
         return true;
     }
@@ -327,7 +327,7 @@ fn append_chunk_with_cap(buffer: &mut Vec<u8>, chunk: &[u8], hard_cap: usize) ->
     buffer.len() >= hard_cap
 }
 
-fn normalize_allowed_domains(domains: Vec<String>) -> Vec<String> {
+pub(crate) fn normalize_allowed_domains(domains: Vec<String>) -> Vec<String> {
     let mut normalized = domains
         .into_iter()
         .filter_map(|d| normalize_domain(&d))
@@ -337,7 +337,7 @@ fn normalize_allowed_domains(domains: Vec<String>) -> Vec<String> {
     normalized
 }
 
-fn normalize_domain(raw: &str) -> Option<String> {
+pub(crate) fn normalize_domain(raw: &str) -> Option<String> {
     let mut d = raw.trim().to_lowercase();
     if d.is_empty() {
         return None;
@@ -366,7 +366,7 @@ fn normalize_domain(raw: &str) -> Option<String> {
     Some(d)
 }
 
-fn extract_host(url: &str) -> anyhow::Result<String> {
+pub(crate) fn extract_host(url: &str) -> anyhow::Result<String> {
     let rest = url
         .strip_prefix("http://")
         .or_else(|| url.strip_prefix("https://"))
@@ -404,7 +404,7 @@ fn extract_host(url: &str) -> anyhow::Result<String> {
     Ok(host)
 }
 
-fn host_matches_allowlist(host: &str, allowed_domains: &[String]) -> bool {
+pub(crate) fn host_matches_allowlist(host: &str, allowed_domains: &[String]) -> bool {
     if allowed_domains.iter().any(|domain| domain == "*") {
         return true;
     }
@@ -417,7 +417,7 @@ fn host_matches_allowlist(host: &str, allowed_domains: &[String]) -> bool {
     })
 }
 
-fn is_private_or_local_host(host: &str) -> bool {
+pub(crate) fn is_private_or_local_host(host: &str) -> bool {
     let bare = host
         .strip_prefix('[')
         .and_then(|h| h.strip_suffix(']'))
@@ -443,7 +443,7 @@ fn is_private_or_local_host(host: &str) -> bool {
 }
 
 #[cfg(not(test))]
-fn validate_resolved_host_is_public(host: &str) -> anyhow::Result<()> {
+pub(crate) fn validate_resolved_host_is_public(host: &str) -> anyhow::Result<()> {
     use std::net::ToSocketAddrs;
 
     let ips = (host, 0)
@@ -456,7 +456,7 @@ fn validate_resolved_host_is_public(host: &str) -> anyhow::Result<()> {
 }
 
 #[cfg(test)]
-fn validate_resolved_host_is_public(_host: &str) -> anyhow::Result<()> {
+pub(crate) fn validate_resolved_host_is_public(_host: &str) -> anyhow::Result<()> {
     // DNS checks are covered by validate_resolved_ips_are_public unit tests.
     Ok(())
 }

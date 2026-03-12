@@ -1,4 +1,4 @@
-use super::traits::{Tool, ToolResult};
+use super::traits::{Tool, ToolExecutionContext, ToolResult};
 use crate::agent::loop_::run_tool_call_loop;
 use crate::config::DelegateAgentConfig;
 use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
@@ -113,53 +113,12 @@ impl DelegateTool {
         self.multimodal_config = config;
         self
     }
-}
 
-#[async_trait]
-impl Tool for DelegateTool {
-    fn name(&self) -> &str {
-        "delegate"
-    }
-
-    fn description(&self) -> &str {
-        "Delegate a subtask to a specialized agent. Use when: a task benefits from a different model \
-         (e.g. fast summarization, deep reasoning, code generation). The sub-agent runs a single \
-         prompt by default; with agentic=true it can iterate with a filtered tool-call loop."
-    }
-
-    fn parameters_schema(&self) -> serde_json::Value {
-        let agent_names: Vec<&str> = self.agents.keys().map(|s: &String| s.as_str()).collect();
-        json!({
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-                "agent": {
-                    "type": "string",
-                    "minLength": 1,
-                    "description": format!(
-                        "Name of the agent to delegate to. Available: {}",
-                        if agent_names.is_empty() {
-                            "(none configured)".to_string()
-                        } else {
-                            agent_names.join(", ")
-                        }
-                    )
-                },
-                "prompt": {
-                    "type": "string",
-                    "minLength": 1,
-                    "description": "The task/prompt to send to the sub-agent"
-                },
-                "context": {
-                    "type": "string",
-                    "description": "Optional context to prepend (e.g. relevant code, prior findings)"
-                }
-            },
-            "required": ["agent", "prompt"]
-        })
-    }
-
-    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+    async fn execute_inner(
+        &self,
+        args: serde_json::Value,
+        tool_context: Option<ToolExecutionContext>,
+    ) -> anyhow::Result<ToolResult> {
         let agent_name = args
             .get("agent")
             .and_then(|v| v.as_str())
@@ -284,6 +243,7 @@ impl Tool for DelegateTool {
                     &*provider,
                     &full_prompt,
                     temperature,
+                    tool_context,
                 )
                 .await;
         }
@@ -339,6 +299,63 @@ impl Tool for DelegateTool {
     }
 }
 
+#[async_trait]
+impl Tool for DelegateTool {
+    fn name(&self) -> &str {
+        "delegate"
+    }
+
+    fn description(&self) -> &str {
+        "Delegate a subtask to a specialized agent. Use when: a task benefits from a different model \
+         (e.g. fast summarization, deep reasoning, code generation). The sub-agent runs a single \
+         prompt by default; with agentic=true it can iterate with a filtered tool-call loop."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        let agent_names: Vec<&str> = self.agents.keys().map(|s: &String| s.as_str()).collect();
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "agent": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": format!(
+                        "Name of the agent to delegate to. Available: {}",
+                        if agent_names.is_empty() {
+                            "(none configured)".to_string()
+                        } else {
+                            agent_names.join(", ")
+                        }
+                    )
+                },
+                "prompt": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "The task/prompt to send to the sub-agent"
+                },
+                "context": {
+                    "type": "string",
+                    "description": "Optional context to prepend (e.g. relevant code, prior findings)"
+                }
+            },
+            "required": ["agent", "prompt"]
+        })
+    }
+
+    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        self.execute_inner(args, None).await
+    }
+
+    async fn execute_with_context(
+        &self,
+        args: serde_json::Value,
+        context: Option<ToolExecutionContext>,
+    ) -> anyhow::Result<ToolResult> {
+        self.execute_inner(args, context).await
+    }
+}
+
 impl DelegateTool {
     async fn execute_agentic(
         &self,
@@ -347,6 +364,7 @@ impl DelegateTool {
         provider: &dyn Provider,
         full_prompt: &str,
         temperature: f64,
+        tool_context: Option<ToolExecutionContext>,
     ) -> anyhow::Result<ToolResult> {
         if agent_config.allowed_tools.is_empty() {
             return Ok(ToolResult {
@@ -411,6 +429,7 @@ impl DelegateTool {
                 None,
                 None,
                 &[],
+                tool_context,
             ),
         )
         .await;
@@ -475,6 +494,14 @@ impl Tool for ToolArcRef {
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         self.inner.execute(args).await
+    }
+
+    async fn execute_with_context(
+        &self,
+        args: serde_json::Value,
+        context: Option<ToolExecutionContext>,
+    ) -> anyhow::Result<ToolResult> {
+        self.inner.execute_with_context(args, context).await
     }
 }
 
@@ -1026,7 +1053,7 @@ mod tests {
 
         let provider = OneToolThenFinalProvider;
         let result = tool
-            .execute_agentic("agentic", &config, &provider, "run", 0.2)
+            .execute_agentic("agentic", &config, &provider, "run", 0.2, None)
             .await
             .unwrap();
 
@@ -1048,7 +1075,7 @@ mod tests {
 
         let provider = OneToolThenFinalProvider;
         let result = tool
-            .execute_agentic("agentic", &config, &provider, "run", 0.2)
+            .execute_agentic("agentic", &config, &provider, "run", 0.2, None)
             .await
             .unwrap();
 
@@ -1068,7 +1095,7 @@ mod tests {
 
         let provider = InfiniteToolCallProvider;
         let result = tool
-            .execute_agentic("agentic", &config, &provider, "run", 0.2)
+            .execute_agentic("agentic", &config, &provider, "run", 0.2, None)
             .await
             .unwrap();
 
@@ -1088,7 +1115,7 @@ mod tests {
 
         let provider = FailingProvider;
         let result = tool
-            .execute_agentic("agentic", &config, &provider, "run", 0.2)
+            .execute_agentic("agentic", &config, &provider, "run", 0.2, None)
             .await
             .unwrap();
 

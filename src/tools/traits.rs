@@ -17,6 +17,20 @@ pub struct ToolSpec {
     pub parameters: serde_json::Value,
 }
 
+/// Optional metadata from the surrounding conversation/runtime.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolExecutionContext {
+    pub conversation_key: Option<String>,
+    pub channel_name: Option<String>,
+    pub reply_target: Option<String>,
+}
+
+impl ToolExecutionContext {
+    pub fn owner_key(&self) -> Option<&str> {
+        self.conversation_key.as_deref()
+    }
+}
+
 /// Core tool trait — implement for any capability
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -31,6 +45,16 @@ pub trait Tool: Send + Sync {
 
     /// Execute the tool with given arguments
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult>;
+
+    /// Execute the tool with optional conversation/runtime context.
+    async fn execute_with_context(
+        &self,
+        args: serde_json::Value,
+        context: Option<ToolExecutionContext>,
+    ) -> anyhow::Result<ToolResult> {
+        let _ = context;
+        self.execute(args).await
+    }
 
     /// Get the full spec for LLM registration
     fn spec(&self) -> ToolSpec {
@@ -102,6 +126,25 @@ mod tests {
         assert!(result.success);
         assert_eq!(result.output, "hello-tool");
         assert!(result.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn execute_with_context_defaults_to_execute() {
+        let tool = DummyTool;
+        let result = tool
+            .execute_with_context(
+                serde_json::json!({ "value": "hello-context" }),
+                Some(ToolExecutionContext {
+                    conversation_key: Some("conv-1".into()),
+                    channel_name: Some("cli".into()),
+                    reply_target: Some("stdout".into()),
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert_eq!(result.output, "hello-context");
     }
 
     #[test]

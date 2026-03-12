@@ -15,8 +15,10 @@
 //! To add a new tool, implement [`Tool`] in a new submodule and register it in
 //! [`all_tools_with_runtime`]. See `AGENTS.md` §7.3 for the full change playbook.
 
+pub mod apply_patch;
 pub mod browser;
 pub mod browser_open;
+pub mod child_session;
 pub mod cli_discovery;
 pub mod composio;
 pub mod content_search;
@@ -45,6 +47,8 @@ pub mod memory_recall;
 pub mod memory_store;
 pub mod model_routing_config;
 pub mod pdf_read;
+pub mod process;
+pub mod process_sessions;
 pub mod proxy_config;
 pub mod pushover;
 pub mod schedule;
@@ -55,8 +59,10 @@ pub mod traits;
 pub mod web_fetch;
 pub mod web_search_tool;
 
+pub use apply_patch::ApplyPatchTool;
 pub use browser::{BrowserTool, ComputerUseConfig};
 pub use browser_open::BrowserOpenTool;
+pub use child_session::ChildSessionTool;
 pub use composio::ComposioTool;
 pub use content_search::ContentSearchTool;
 pub use cron_add::CronAddTool;
@@ -84,6 +90,7 @@ pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
 pub use model_routing_config::ModelRoutingConfigTool;
 pub use pdf_read::PdfReadTool;
+pub use process::ProcessTool;
 pub use proxy_config::ProxyConfigTool;
 pub use pushover::PushoverTool;
 pub use schedule::ScheduleTool;
@@ -91,7 +98,7 @@ pub use schedule::ScheduleTool;
 pub use schema::{CleaningStrategy, SchemaCleanr};
 pub use screenshot::ScreenshotTool;
 pub use shell::ShellTool;
-pub use traits::Tool;
+pub use traits::{Tool, ToolExecutionContext};
 #[allow(unused_imports)]
 pub use traits::{ToolResult, ToolSpec};
 pub use web_fetch::WebFetchTool;
@@ -133,6 +140,14 @@ impl Tool for ArcDelegatingTool {
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         self.inner.execute(args).await
     }
+
+    async fn execute_with_context(
+        &self,
+        args: serde_json::Value,
+        context: Option<ToolExecutionContext>,
+    ) -> anyhow::Result<ToolResult> {
+        self.inner.execute_with_context(args, context).await
+    }
 }
 
 fn boxed_registry_from_arcs(tools: Vec<Arc<dyn Tool>>) -> Vec<Box<dyn Tool>> {
@@ -154,6 +169,7 @@ pub fn default_tools_with_runtime(
         Box::new(FileReadTool::new(security.clone())),
         Box::new(FileWriteTool::new(security.clone())),
         Box::new(FileEditTool::new(security.clone())),
+        Box::new(ApplyPatchTool::new(security.clone())),
         Box::new(GlobSearchTool::new(security.clone())),
         Box::new(ContentSearchTool::new(security)),
     ]
@@ -209,11 +225,18 @@ pub fn all_tools_with_runtime(
     fallback_api_key: Option<&str>,
     root_config: &crate::config::Config,
 ) -> Vec<Box<dyn Tool>> {
+    let process_registry = Arc::new(process_sessions::ProcessSessionRegistry::default());
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(ShellTool::new(security.clone(), runtime)),
+        Arc::new(ShellTool::new(security.clone(), runtime.clone())),
         Arc::new(FileReadTool::new(security.clone())),
         Arc::new(FileWriteTool::new(security.clone())),
         Arc::new(FileEditTool::new(security.clone())),
+        Arc::new(ApplyPatchTool::new(security.clone())),
+        Arc::new(ProcessTool::new(
+            security.clone(),
+            runtime.clone(),
+            process_registry,
+        )),
         Arc::new(GlobSearchTool::new(security.clone())),
         Arc::new(ContentSearchTool::new(security.clone())),
         Arc::new(CronAddTool::new(config.clone(), security.clone())),
@@ -325,24 +348,33 @@ pub fn all_tools_with_runtime(
             (!trimmed_value.is_empty()).then(|| trimmed_value.to_owned())
         });
         let parent_tools = Arc::new(tool_arcs.clone());
-        let delegate_tool = DelegateTool::new_with_options(
+        let delegate_tool = Arc::new(
+            DelegateTool::new_with_options(
+                delegate_agents.clone(),
+                delegate_fallback_credential,
+                security.clone(),
+                crate::providers::ProviderRuntimeOptions {
+                    auth_profile_override: None,
+                    provider_api_url: root_config.api_url.clone(),
+                    zeroclaw_dir: root_config
+                        .config_path
+                        .parent()
+                        .map(std::path::PathBuf::from),
+                    secrets_encrypt: root_config.secrets.encrypt,
+                    reasoning_enabled: root_config.runtime.reasoning_enabled,
+                },
+            )
+            .with_parent_tools(parent_tools)
+            .with_multimodal_config(root_config.multimodal.clone()),
+        );
+        let delegate_tool_dyn: Arc<dyn Tool> = delegate_tool.clone();
+        tool_arcs.push(delegate_tool_dyn.clone());
+        tool_arcs.push(Arc::new(ChildSessionTool::new(
             delegate_agents,
-            delegate_fallback_credential,
+            delegate_tool_dyn,
             security.clone(),
-            crate::providers::ProviderRuntimeOptions {
-                auth_profile_override: None,
-                provider_api_url: root_config.api_url.clone(),
-                zeroclaw_dir: root_config
-                    .config_path
-                    .parent()
-                    .map(std::path::PathBuf::from),
-                secrets_encrypt: root_config.secrets.encrypt,
-                reasoning_enabled: root_config.runtime.reasoning_enabled,
-            },
-        )
-        .with_parent_tools(parent_tools)
-        .with_multimodal_config(root_config.multimodal.clone());
-        tool_arcs.push(Arc::new(delegate_tool));
+            Arc::new(child_session::ChildSessionRegistry::default()),
+        )));
     }
 
     boxed_registry_from_arcs(tool_arcs)
@@ -366,7 +398,7 @@ mod tests {
     fn default_tools_has_expected_count() {
         let security = Arc::new(SecurityPolicy::default());
         let tools = default_tools(security);
-        assert_eq!(tools.len(), 6);
+        assert_eq!(tools.len(), 7);
     }
 
     #[test]
@@ -462,6 +494,7 @@ mod tests {
         assert!(names.contains(&"file_read"));
         assert!(names.contains(&"file_write"));
         assert!(names.contains(&"file_edit"));
+        assert!(names.contains(&"apply_patch"));
         assert!(names.contains(&"glob_search"));
         assert!(names.contains(&"content_search"));
     }
@@ -597,6 +630,7 @@ mod tests {
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"delegate"));
+        assert!(names.contains(&"child_session"));
     }
 
     #[test]
@@ -630,5 +664,6 @@ mod tests {
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"delegate"));
+        assert!(!names.contains(&"child_session"));
     }
 }

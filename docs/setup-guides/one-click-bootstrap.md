@@ -130,6 +130,27 @@ See all options:
 ./install.sh --help
 ```
 
+## Post-bootstrap defaults for public channels
+
+Fresh installs should keep higher-impact coding and ops tools conservative until channel behavior is validated.
+
+Recommended baseline:
+
+```toml
+[autonomy]
+non_cli_excluded_tools = ["apply_patch", "process", "child_session"]
+
+[url_prefetch]
+enabled = true
+allowed_domains = ["gist.githubusercontent.com", "raw.githubusercontent.com"]
+```
+
+Guidance:
+
+- Keep `apply_patch`, `process`, and `child_session` hidden from Discord/Feishu-style channels unless you explicitly want live coding or background job control there.
+- Enable `url_prefetch` only for direct-content hosts you trust. It is useful for gist/raw links, not for generic website browsing.
+- Validate with `zeroclaw doctor` after editing config, then restart the daemon or service.
+
 ## Related docs
 
 - [README.md](../README.md)
