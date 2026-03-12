@@ -161,6 +161,13 @@ impl SqliteMemory {
                 VALUES (new.rowid, new.key, new.content);
             END;
 
+            -- Conversation history persistence (per-sender, JSON array)
+            CREATE TABLE IF NOT EXISTS conversation_history (
+                history_key TEXT PRIMARY KEY,
+                messages    TEXT NOT NULL,
+                updated_at  TEXT NOT NULL
+            );
+
             -- Embedding cache with LRU eviction
             CREATE TABLE IF NOT EXISTS embedding_cache (
                 content_hash TEXT PRIMARY KEY,
@@ -427,6 +434,70 @@ impl SqliteMemory {
         }
 
         Ok(count)
+    }
+
+    /// Upsert conversation history for a sender key.
+    pub async fn save_history(
+        &self,
+        key: &str,
+        messages: &[crate::providers::ChatMessage],
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.clone();
+        let key = key.to_string();
+        let json = serde_json::to_string(messages)?;
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let conn = conn.lock();
+            let now = chrono::Local::now().to_rfc3339();
+            conn.execute(
+                "INSERT INTO conversation_history (history_key, messages, updated_at)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(history_key) DO UPDATE SET
+                    messages = excluded.messages,
+                    updated_at = excluded.updated_at",
+                params![key, json, now],
+            )?;
+            Ok(())
+        })
+        .await?
+    }
+
+    /// Load conversation history for a sender key.
+    pub async fn load_history(
+        &self,
+        key: &str,
+    ) -> anyhow::Result<Option<Vec<crate::providers::ChatMessage>>> {
+        let conn = self.conn.clone();
+        let key = key.to_string();
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Vec<crate::providers::ChatMessage>>> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT messages FROM conversation_history WHERE history_key = ?1",
+            )?;
+            let mut rows = stmt.query_map(params![key], |row| row.get::<_, String>(0))?;
+            match rows.next() {
+                Some(Ok(json)) => Ok(Some(serde_json::from_str(&json)?)),
+                _ => Ok(None),
+            }
+        })
+        .await?
+    }
+
+    /// Delete conversation history for a sender key.
+    pub async fn delete_history(&self, key: &str) -> anyhow::Result<()> {
+        let conn = self.conn.clone();
+        let key = key.to_string();
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let conn = conn.lock();
+            conn.execute(
+                "DELETE FROM conversation_history WHERE history_key = ?1",
+                params![key],
+            )?;
+            Ok(())
+        })
+        .await?
     }
 }
 
@@ -778,6 +849,25 @@ impl Memory for SqliteMemory {
         tokio::task::spawn_blocking(move || conn.lock().execute_batch("SELECT 1").is_ok())
             .await
             .unwrap_or(false)
+    }
+
+    async fn save_conversation_history(
+        &self,
+        key: &str,
+        messages: &[crate::providers::ChatMessage],
+    ) -> anyhow::Result<()> {
+        self.save_history(key, messages).await
+    }
+
+    async fn load_conversation_history(
+        &self,
+        key: &str,
+    ) -> anyhow::Result<Option<Vec<crate::providers::ChatMessage>>> {
+        self.load_history(key).await
+    }
+
+    async fn delete_conversation_history(&self, key: &str) -> anyhow::Result<()> {
+        self.delete_history(key).await
     }
 }
 
@@ -1896,5 +1986,68 @@ mod tests {
         mem.reindex().await.unwrap();
 
         assert_eq!(mem.count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn conversation_history_save_and_load_roundtrip() {
+        let (_tmp, mem) = temp_sqlite();
+        let messages = vec![
+            crate::providers::ChatMessage::user("Hello"),
+            crate::providers::ChatMessage::assistant("Hi there!"),
+            crate::providers::ChatMessage::user("How are you?"),
+        ];
+
+        mem.save_history("discord_123_user1", &messages)
+            .await
+            .unwrap();
+
+        let loaded = mem
+            .load_history("discord_123_user1")
+            .await
+            .unwrap()
+            .expect("should have history");
+        assert_eq!(loaded.len(), 3);
+        assert_eq!(loaded[0].role, "user");
+        assert_eq!(loaded[0].content, "Hello");
+        assert_eq!(loaded[1].role, "assistant");
+        assert_eq!(loaded[1].content, "Hi there!");
+        assert_eq!(loaded[2].role, "user");
+        assert_eq!(loaded[2].content, "How are you?");
+    }
+
+    #[tokio::test]
+    async fn conversation_history_delete_removes_entry() {
+        let (_tmp, mem) = temp_sqlite();
+        let messages = vec![crate::providers::ChatMessage::user("test")];
+
+        mem.save_history("key1", &messages).await.unwrap();
+        assert!(mem.load_history("key1").await.unwrap().is_some());
+
+        mem.delete_history("key1").await.unwrap();
+        assert!(mem.load_history("key1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn conversation_history_upsert_replaces() {
+        let (_tmp, mem) = temp_sqlite();
+
+        let v1 = vec![crate::providers::ChatMessage::user("first")];
+        mem.save_history("key1", &v1).await.unwrap();
+
+        let v2 = vec![
+            crate::providers::ChatMessage::user("first"),
+            crate::providers::ChatMessage::assistant("second"),
+        ];
+        mem.save_history("key1", &v2).await.unwrap();
+
+        let loaded = mem.load_history("key1").await.unwrap().unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[1].content, "second");
+    }
+
+    #[tokio::test]
+    async fn conversation_history_load_missing_returns_none() {
+        let (_tmp, mem) = temp_sqlite();
+        assert!(mem.load_history("nonexistent").await.unwrap().is_none());
     }
 }

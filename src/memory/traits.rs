@@ -1,3 +1,4 @@
+use crate::providers::ChatMessage;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
@@ -92,6 +93,28 @@ pub trait Memory: Send + Sync {
 
     /// Health check
     async fn health_check(&self) -> bool;
+
+    /// Save conversation history for a sender key (write-through)
+    async fn save_conversation_history(
+        &self,
+        _key: &str,
+        _messages: &[ChatMessage],
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Load conversation history for a sender key
+    async fn load_conversation_history(
+        &self,
+        _key: &str,
+    ) -> anyhow::Result<Option<Vec<ChatMessage>>> {
+        Ok(None)
+    }
+
+    /// Delete conversation history for a sender key
+    async fn delete_conversation_history(&self, _key: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
