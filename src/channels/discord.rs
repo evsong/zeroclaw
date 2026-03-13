@@ -54,6 +54,61 @@ impl DiscordChannel {
         let part = token.split('.').next()?;
         base64_decode(part)
     }
+
+    /// Register Discord slash commands (global). Best-effort, logs errors but
+    /// does not fail startup.
+    async fn register_slash_commands(&self, application_id: &str) {
+        let commands = json!([
+            {
+                "name": "new",
+                "description": "Clear conversation history and start fresh",
+                "type": 1
+            },
+            {
+                "name": "model",
+                "description": "Switch the current model",
+                "type": 1,
+                "options": [{
+                    "name": "name",
+                    "description": "Model name (e.g. gpt-5.4)",
+                    "type": 3,
+                    "required": true
+                }]
+            },
+            {
+                "name": "models",
+                "description": "List available models/providers",
+                "type": 1
+            }
+        ]);
+
+        let url = format!(
+            "https://discord.com/api/v10/applications/{application_id}/commands"
+        );
+
+        match self
+            .http_client()
+            .put(&url)
+            .header("Authorization", format!("Bot {}", self.bot_token))
+            .json(&commands)
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                tracing::info!("Discord: registered slash commands (/new, /model, /models)");
+            }
+            Ok(resp) => {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                tracing::warn!(
+                    "Discord: failed to register slash commands: {status} {body}"
+                );
+            }
+            Err(e) => {
+                tracing::warn!("Discord: failed to register slash commands: {e}");
+            }
+        }
+    }
 }
 
 /// Process Discord message attachments and return a string to append to the
@@ -590,6 +645,9 @@ impl Channel for DiscordChannel {
 
         tracing::info!("Discord: connected and identified");
 
+        // Register slash commands (best-effort, don't fail if it doesn't work)
+        self.register_slash_commands(&bot_user_id).await;
+
         // Track the last sequence number for heartbeats and resume.
         // Only accessed in the select! loop below, so a plain i64 suffices.
         let mut sequence: i64 = -1;
@@ -609,6 +667,11 @@ impl Channel for DiscordChannel {
         });
 
         let guild_filter = self.guild_id.clone();
+
+        // Dedup buffer: track recently seen message IDs to avoid processing
+        // the same Discord message twice (can happen on gateway reconnects).
+        let mut seen_message_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        const MAX_SEEN_IDS: usize = 500;
 
         loop {
             tokio::select! {
@@ -661,8 +724,94 @@ impl Channel for DiscordChannel {
                         _ => {}
                     }
 
-                    // Only handle MESSAGE_CREATE (opcode 0, type "MESSAGE_CREATE")
                     let event_type = event.get("t").and_then(|t| t.as_str()).unwrap_or("");
+
+                    // Handle slash command interactions
+                    if event_type == "INTERACTION_CREATE" {
+                        if let Some(d) = event.get("d") {
+                            let interaction_type = d.get("type").and_then(serde_json::Value::as_u64).unwrap_or(0);
+                            // Type 2 = APPLICATION_COMMAND
+                            if interaction_type == 2 {
+                                let interaction_id = d.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                                let interaction_token = d.get("token").and_then(|v| v.as_str()).unwrap_or("");
+                                let cmd_name = d.get("data")
+                                    .and_then(|data| data.get("name"))
+                                    .and_then(|n| n.as_str())
+                                    .unwrap_or("");
+                                let author_id = d.get("member")
+                                    .and_then(|m| m.get("user"))
+                                    .or(d.get("user"))
+                                    .and_then(|u| u.get("id"))
+                                    .and_then(|i| i.as_str())
+                                    .unwrap_or("");
+                                let channel_id = d.get("channel_id")
+                                    .and_then(|c| c.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+
+                                // ACK the interaction immediately (type 4 = CHANNEL_MESSAGE_WITH_SOURCE)
+                                if !interaction_id.is_empty() && !interaction_token.is_empty() {
+                                    let ack_url = format!(
+                                        "https://discord.com/api/v10/interactions/{interaction_id}/{interaction_token}/callback"
+                                    );
+                                    let ack_body = json!({
+                                        "type": 4,
+                                        "data": { "content": format!("✅ `/{cmd_name}` received") }
+                                    });
+                                    let client = self.http_client();
+                                    let bot_token = self.bot_token.clone();
+                                    tokio::spawn(async move {
+                                        let _ = client.post(&ack_url)
+                                            .header("Authorization", format!("Bot {bot_token}"))
+                                            .json(&ack_body)
+                                            .send()
+                                            .await;
+                                    });
+                                }
+
+                                // Convert slash command to internal command message
+                                if !cmd_name.is_empty() && !author_id.is_empty() && self.is_user_allowed(author_id) {
+                                    // Get optional string argument
+                                    let arg_value = d.get("data")
+                                        .and_then(|data| data.get("options"))
+                                        .and_then(|opts| opts.as_array())
+                                        .and_then(|arr| arr.first())
+                                        .and_then(|opt| opt.get("value"))
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    let content = if arg_value.is_empty() {
+                                        format!("/{cmd_name}")
+                                    } else {
+                                        format!("/{cmd_name} {arg_value}")
+                                    };
+
+                                    let channel_msg = ChannelMessage {
+                                        id: format!("discord_interaction_{interaction_id}"),
+                                        sender: author_id.to_string(),
+                                        reply_target: if channel_id.is_empty() {
+                                            author_id.to_string()
+                                        } else {
+                                            channel_id.clone()
+                                        },
+                                        content,
+                                        channel: "discord".to_string(),
+                                        timestamp: std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_secs(),
+                                        thread_ts: Some(channel_id),
+                                    };
+
+                                    if tx.send(channel_msg).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        continue;
+                    }
+
+                    // Only handle MESSAGE_CREATE
                     if event_type != "MESSAGE_CREATE" {
                         continue;
                     }
@@ -721,6 +870,19 @@ impl Channel for DiscordChannel {
                     };
 
                     let message_id = d.get("id").and_then(|i| i.as_str()).unwrap_or("");
+
+                    // Dedup: skip if we've already processed this message ID
+                    if !message_id.is_empty() {
+                        if !seen_message_ids.insert(message_id.to_string()) {
+                            tracing::debug!("Discord: skipping duplicate message {message_id}");
+                            continue;
+                        }
+                        // Prevent unbounded growth
+                        if seen_message_ids.len() > MAX_SEEN_IDS {
+                            seen_message_ids.clear();
+                        }
+                    }
+
                     let channel_id = d
                         .get("channel_id")
                         .and_then(|c| c.as_str())
