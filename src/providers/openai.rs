@@ -67,8 +67,9 @@ struct NativeChatRequest {
 #[derive(Debug, Serialize)]
 struct NativeMessage {
     role: String,
+    /// Content can be a string or an array of content parts (for multimodal/vision).
     #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<String>,
+    content: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -77,6 +78,21 @@ struct NativeMessage {
     /// that require it in assistant tool-call history messages.
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_content: Option<String>,
+}
+
+/// Build multimodal content array with text + image_url parts (OpenAI vision format).
+fn build_multimodal_content(text: &str, image_urls: &[String]) -> serde_json::Value {
+    let mut parts = Vec::new();
+    if !text.is_empty() {
+        parts.push(serde_json::json!({"type": "text", "text": text}));
+    }
+    for url in image_urls {
+        parts.push(serde_json::json!({
+            "type": "image_url",
+            "image_url": {"url": url}
+        }));
+    }
+    serde_json::Value::Array(parts)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -220,7 +236,7 @@ impl OpenAiProvider {
                                 let content = value
                                     .get("content")
                                     .and_then(serde_json::Value::as_str)
-                                    .map(ToString::to_string);
+                                    .map(|s| serde_json::Value::String(s.to_string()));
                                 let reasoning_content = value
                                     .get("reasoning_content")
                                     .and_then(serde_json::Value::as_str)
@@ -246,7 +262,7 @@ impl OpenAiProvider {
                         let content = value
                             .get("content")
                             .and_then(serde_json::Value::as_str)
-                            .map(ToString::to_string);
+                            .map(|s| serde_json::Value::String(s.to_string()));
                         return NativeMessage {
                             role: "tool".to_string(),
                             content,
@@ -257,9 +273,23 @@ impl OpenAiProvider {
                     }
                 }
 
+                // For user messages with image_urls, build multimodal content array
+                let content = if m.role == "user" {
+                    if let Some(ref urls) = m.image_urls {
+                        if urls.is_empty() {
+                            Some(serde_json::Value::String(m.content.clone()))
+                        } else {
+                            Some(build_multimodal_content(&m.content, urls))
+                        }
+                    } else {
+                        Some(serde_json::Value::String(m.content.clone()))
+                    }
+                } else {
+                    Some(serde_json::Value::String(m.content.clone()))
+                };
                 NativeMessage {
                     role: m.role.clone(),
-                    content: Some(m.content.clone()),
+                    content,
                     tool_call_id: None,
                     tool_calls: None,
                     reasoning_content: None,
@@ -806,7 +836,7 @@ mod tests {
     fn native_message_omits_reasoning_content_when_none() {
         let msg = NativeMessage {
             role: "assistant".to_string(),
-            content: Some("hi".to_string()),
+            content: Some(serde_json::Value::String("hi".to_string())),
             tool_call_id: None,
             tool_calls: None,
             reasoning_content: None,
@@ -819,7 +849,7 @@ mod tests {
     fn native_message_includes_reasoning_content_when_some() {
         let msg = NativeMessage {
             role: "assistant".to_string(),
-            content: Some("hi".to_string()),
+            content: Some(serde_json::Value::String("hi".to_string())),
             tool_call_id: None,
             tool_calls: None,
             reasoning_content: Some("thinking...".to_string()),
@@ -827,5 +857,48 @@ mod tests {
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("reasoning_content"));
         assert!(json.contains("thinking..."));
+    }
+
+    #[test]
+    fn build_multimodal_content_produces_correct_format() {
+        let result = build_multimodal_content(
+            "what is this?",
+            &["https://cdn.discord.com/img.png".to_string()],
+        );
+        let arr = result.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["type"], "text");
+        assert_eq!(arr[0]["text"], "what is this?");
+        assert_eq!(arr[1]["type"], "image_url");
+        assert_eq!(arr[1]["image_url"]["url"], "https://cdn.discord.com/img.png");
+    }
+
+    #[test]
+    fn convert_messages_with_image_urls_produces_array_content() {
+        use crate::providers::ChatMessage;
+
+        let messages = vec![ChatMessage::user_with_images(
+            "describe this",
+            vec!["https://example.com/photo.jpg".to_string()],
+        )];
+        let native = OpenAiProvider::convert_messages(&messages);
+        assert_eq!(native.len(), 1);
+        let content = native[0].content.as_ref().unwrap();
+        let arr = content.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["type"], "text");
+        assert_eq!(arr[1]["type"], "image_url");
+    }
+
+    #[test]
+    fn convert_messages_without_image_urls_produces_string_content() {
+        use crate::providers::ChatMessage;
+
+        let messages = vec![ChatMessage::user("hello")];
+        let native = OpenAiProvider::convert_messages(&messages);
+        assert_eq!(native.len(), 1);
+        let content = native[0].content.as_ref().unwrap();
+        assert!(content.is_string());
+        assert_eq!(content.as_str().unwrap(), "hello");
     }
 }

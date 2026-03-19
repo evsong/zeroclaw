@@ -990,13 +990,47 @@ impl OpenAiCompatibleProvider {
                     }
                 }
 
-                NativeMessage {
-                    role: message.role.clone(),
-                    content: Some(Self::to_message_content(
+                // Check for image_urls from Discord multimodal vision
+                let content = if message.role == "user" {
+                    if let Some(ref urls) = message.image_urls {
+                        if urls.is_empty() {
+                            Some(Self::to_message_content(
+                                &message.role,
+                                &message.content,
+                                allow_user_image_parts,
+                            ))
+                        } else {
+                            let mut parts = Vec::with_capacity(urls.len() + 1);
+                            let text = message.content.trim();
+                            if !text.is_empty() {
+                                parts.push(MessagePart::Text {
+                                    text: text.to_string(),
+                                });
+                            }
+                            for url in urls {
+                                parts.push(MessagePart::ImageUrl {
+                                    image_url: ImageUrlPart { url: url.clone() },
+                                });
+                            }
+                            Some(MessageContent::Parts(parts))
+                        }
+                    } else {
+                        Some(Self::to_message_content(
+                            &message.role,
+                            &message.content,
+                            allow_user_image_parts,
+                        ))
+                    }
+                } else {
+                    Some(Self::to_message_content(
                         &message.role,
                         &message.content,
                         allow_user_image_parts,
-                    )),
+                    ))
+                };
+                NativeMessage {
+                    role: message.role.clone(),
+                    content,
                     tool_call_id: None,
                     tool_calls: None,
                     reasoning_content: None,
@@ -2568,6 +2602,7 @@ mod tests {
         let messages = vec![ChatMessage {
             role: "user".to_string(),
             content: "hello".to_string(),
+            image_urls: None,
         }];
         let tools = vec![serde_json::json!({
             "type": "function",

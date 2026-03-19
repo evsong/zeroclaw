@@ -159,6 +159,57 @@ async fn process_attachments(
     parts.join("\n---\n")
 }
 
+/// Process Discord message attachments, returning inlined text AND image URLs
+/// for multimodal vision support. Text attachments are fetched and inlined;
+/// image attachments have their URLs collected for `image_url` content parts.
+async fn process_attachments_multimodal(
+    attachments: &[serde_json::Value],
+    client: &reqwest::Client,
+) -> (String, Vec<String>) {
+    let mut text_parts: Vec<String> = Vec::new();
+    let mut image_urls: Vec<String> = Vec::new();
+    for att in attachments {
+        let ct = att
+            .get("content_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let name = att
+            .get("filename")
+            .and_then(|v| v.as_str())
+            .unwrap_or("file");
+        let Some(url) = att.get("url").and_then(|v| v.as_str()) else {
+            tracing::warn!(name, "discord: attachment has no url, skipping");
+            continue;
+        };
+        if ct.starts_with("image/") {
+            // Collect image URLs for multimodal vision
+            image_urls.push(url.to_string());
+            tracing::info!(name, url, "discord: collected image attachment for vision");
+        } else if ct.starts_with("text/") {
+            match client.get(url).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    if let Ok(text) = resp.text().await {
+                        text_parts.push(format!("[{name}]\n{text}"));
+                    }
+                }
+                Ok(resp) => {
+                    tracing::warn!(name, status = %resp.status(), "discord attachment fetch failed");
+                }
+                Err(e) => {
+                    tracing::warn!(name, error = %e, "discord attachment fetch error");
+                }
+            }
+        } else {
+            tracing::debug!(
+                name,
+                content_type = ct,
+                "discord: skipping unsupported attachment type"
+            );
+        }
+    }
+    (text_parts.join("\n---\n"), image_urls)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DiscordAttachmentKind {
     Image,
@@ -800,6 +851,7 @@ impl Channel for DiscordChannel {
                                             .unwrap_or_default()
                                             .as_secs(),
                                         thread_ts: Some(channel_id),
+                                        image_urls: None,
                                     };
 
                                     if tx.send(channel_msg).await.is_err() {
@@ -855,14 +907,13 @@ impl Channel for DiscordChannel {
                         continue;
                     };
 
-                    let attachment_text = {
-                        let atts = d
-                            .get("attachments")
-                            .and_then(|a| a.as_array())
-                            .cloned()
-                            .unwrap_or_default();
-                        process_attachments(&atts, &self.http_client()).await
-                    };
+                    let atts = d
+                        .get("attachments")
+                        .and_then(|a| a.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                    let (attachment_text, image_urls) =
+                        process_attachments_multimodal(&atts, &self.http_client()).await;
                     let final_content = if attachment_text.is_empty() {
                         clean_content
                     } else {
@@ -935,6 +986,7 @@ impl Channel for DiscordChannel {
                             .unwrap_or_default()
                             .as_secs(),
                         thread_ts: Some(channel_id.clone()),
+                        image_urls: if image_urls.is_empty() { None } else { Some(image_urls) },
                     };
 
                     if tx.send(channel_msg).await.is_err() {
@@ -1667,5 +1719,59 @@ mod tests {
             rendered,
             "Done\nhttps://example.com/a.png\n[IMAGE:/tmp/missing.png]"
         );
+    }
+
+    // process_attachments_multimodal tests
+
+    #[tokio::test]
+    async fn process_attachments_multimodal_collects_image_urls() {
+        let client = reqwest::Client::new();
+        let attachments = vec![
+            serde_json::json!({
+                "url": "https://cdn.discordapp.com/attachments/1/2/photo.png",
+                "filename": "photo.png",
+                "content_type": "image/png"
+            }),
+            serde_json::json!({
+                "url": "https://cdn.discordapp.com/attachments/1/2/screenshot.jpg",
+                "filename": "screenshot.jpg",
+                "content_type": "image/jpeg"
+            }),
+        ];
+        let (text, image_urls) = process_attachments_multimodal(&attachments, &client).await;
+        assert!(text.is_empty());
+        assert_eq!(image_urls.len(), 2);
+        assert_eq!(
+            image_urls[0],
+            "https://cdn.discordapp.com/attachments/1/2/photo.png"
+        );
+        assert_eq!(
+            image_urls[1],
+            "https://cdn.discordapp.com/attachments/1/2/screenshot.jpg"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_attachments_multimodal_skips_unsupported_types() {
+        let client = reqwest::Client::new();
+        let attachments = vec![serde_json::json!({
+            "url": "https://cdn.discordapp.com/attachments/1/2/doc.pdf",
+            "filename": "doc.pdf",
+            "content_type": "application/pdf"
+        })];
+        let (text, image_urls) = process_attachments_multimodal(&attachments, &client).await;
+        assert!(text.is_empty());
+        assert!(image_urls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn process_attachments_multimodal_skips_attachment_without_url() {
+        let client = reqwest::Client::new();
+        let attachments = vec![serde_json::json!({
+            "filename": "orphan.png",
+            "content_type": "image/png"
+        })];
+        let (_text, image_urls) = process_attachments_multimodal(&attachments, &client).await;
+        assert!(image_urls.is_empty());
     }
 }

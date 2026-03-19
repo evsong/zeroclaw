@@ -2081,7 +2081,13 @@ async fn process_channel_message(
         .is_some_and(|turns| !turns.is_empty());
 
     // Preserve user turn before the LLM call so interrupted requests keep context.
-    append_sender_turn(ctx.as_ref(), &history_key, ChatMessage::user(&msg.content));
+    // Include image URLs for multimodal vision when present.
+    let user_turn = if let Some(ref urls) = msg.image_urls {
+        ChatMessage::user_with_images(&msg.content, urls.clone())
+    } else {
+        ChatMessage::user(&msg.content)
+    };
+    append_sender_turn(ctx.as_ref(), &history_key, user_turn);
 
     // Build history from per-sender conversation cache.
     let prior_turns_raw = ctx
@@ -5165,6 +5171,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                image_urls: None,
             },
             CancellationToken::new(),
         )
@@ -5226,6 +5233,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                image_urls: None,
             },
             CancellationToken::new(),
         )
@@ -5301,6 +5309,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 3,
                 thread_ts: None,
+                image_urls: None,
             },
             CancellationToken::new(),
         )
@@ -5362,6 +5371,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                image_urls: None,
             },
             CancellationToken::new(),
         )
@@ -5433,6 +5443,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                image_urls: None,
             },
             CancellationToken::new(),
         )
@@ -5484,6 +5495,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                image_urls: None,
             },
             CancellationToken::new(),
         )
@@ -5540,6 +5552,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                image_urls: None,
             },
             CancellationToken::new(),
         )
@@ -5608,6 +5621,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                image_urls: None,
             },
             CancellationToken::new(),
         )
@@ -5699,6 +5713,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                image_urls: None,
             },
             CancellationToken::new(),
         )
@@ -5772,6 +5787,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 3,
                 thread_ts: None,
+                image_urls: None,
             },
             CancellationToken::new(),
         )
@@ -5860,6 +5876,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 4,
                 thread_ts: None,
+                image_urls: None,
             },
             CancellationToken::new(),
         )
@@ -5933,6 +5950,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                image_urls: None,
             },
             CancellationToken::new(),
         )
@@ -5995,6 +6013,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                image_urls: None,
             },
             CancellationToken::new(),
         )
@@ -6167,6 +6186,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "test-channel".to_string(),
             timestamp: 1,
             thread_ts: None,
+            image_urls: None,
         })
         .await
         .unwrap();
@@ -6178,6 +6198,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "test-channel".to_string(),
             timestamp: 2,
             thread_ts: None,
+            image_urls: None,
         })
         .await
         .unwrap();
@@ -6250,6 +6271,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                image_urls: None,
             })
             .await
             .unwrap();
@@ -6262,6 +6284,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                image_urls: None,
             })
             .await
             .unwrap();
@@ -6344,6 +6367,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                image_urls: None,
             })
             .await
             .unwrap();
@@ -6356,6 +6380,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                image_urls: None,
             })
             .await
             .unwrap();
@@ -6420,6 +6445,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                image_urls: None,
             },
             CancellationToken::new(),
         )
@@ -6481,6 +6507,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                image_urls: None,
             },
             CancellationToken::new(),
         )
@@ -6857,6 +6884,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 1,
             thread_ts: None,
+            image_urls: None,
         };
 
         assert_eq!(conversation_memory_key(&msg), "slack_U123_msg_abc123");
@@ -6872,6 +6900,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 1,
             thread_ts: None,
+            image_urls: None,
         };
         let msg2 = traits::ChannelMessage {
             id: "msg_2".into(),
@@ -6881,6 +6910,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 2,
             thread_ts: None,
+            image_urls: None,
         };
 
         assert_ne!(
@@ -6902,6 +6932,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 1,
             thread_ts: None,
+            image_urls: None,
         };
         let msg2 = traits::ChannelMessage {
             id: "msg_2".into(),
@@ -6911,6 +6942,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 2,
             thread_ts: None,
+            image_urls: None,
         };
 
         mem.store(
@@ -6999,6 +7031,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                image_urls: None,
             },
             CancellationToken::new(),
         )
@@ -7014,6 +7047,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                image_urls: None,
             },
             CancellationToken::new(),
         )
@@ -7086,6 +7120,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                image_urls: None,
             },
             CancellationToken::new(),
         )
@@ -7174,6 +7209,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                image_urls: None,
             },
             CancellationToken::new(),
         )
@@ -7266,6 +7302,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                image_urls: None,
             },
             CancellationToken::new(),
         )
@@ -7328,6 +7365,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                image_urls: None,
             },
             CancellationToken::new(),
         )
@@ -7407,6 +7445,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                image_urls: None,
             },
             CancellationToken::new(),
         )
@@ -7496,6 +7535,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                image_urls: None,
             },
             CancellationToken::new(),
         )
@@ -8048,6 +8088,7 @@ This is an example JSON object for profile settings."#;
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                image_urls: None,
             },
             CancellationToken::new(),
         )
@@ -8115,6 +8156,7 @@ This is an example JSON object for profile settings."#;
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                image_urls: None,
             },
             CancellationToken::new(),
         )
@@ -8130,6 +8172,7 @@ This is an example JSON object for profile settings."#;
                 channel: "test-channel".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                image_urls: None,
             },
             CancellationToken::new(),
         )

@@ -213,6 +213,7 @@ impl LinqChannel {
             channel: "linq".to_string(),
             timestamp,
             thread_ts: None,
+            image_urls: None,
         });
 
         messages

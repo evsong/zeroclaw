@@ -12,6 +12,9 @@ pub struct ChannelMessage {
     /// Platform thread identifier (e.g. Slack `ts`, Discord thread ID).
     /// When set, replies should be posted as threaded responses.
     pub thread_ts: Option<String>,
+    /// Image URLs attached to this message (e.g. Discord image attachments).
+    /// When set, these are passed to the LLM as multimodal `image_url` content parts.
+    pub image_urls: Option<Vec<String>>,
 }
 
 /// Message to send through a channel
@@ -172,6 +175,7 @@ mod tests {
                 channel: "dummy".into(),
                 timestamp: 123,
                 thread_ts: None,
+                image_urls: None,
             })
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))
@@ -188,6 +192,7 @@ mod tests {
             channel: "dummy".into(),
             timestamp: 999,
             thread_ts: None,
+            image_urls: None,
         };
 
         let cloned = message.clone();

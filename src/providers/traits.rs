@@ -9,6 +9,10 @@ use std::fmt::Write;
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    /// Optional image URLs for multimodal messages (vision).
+    /// When set, providers should send these as `image_url` content parts.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub image_urls: Option<Vec<String>>,
 }
 
 impl ChatMessage {
@@ -16,6 +20,7 @@ impl ChatMessage {
         Self {
             role: "system".into(),
             content: content.into(),
+            image_urls: None,
         }
     }
 
@@ -23,6 +28,16 @@ impl ChatMessage {
         Self {
             role: "user".into(),
             content: content.into(),
+            image_urls: None,
+        }
+    }
+
+    /// Create a user message with image attachments (multimodal/vision).
+    pub fn user_with_images(content: impl Into<String>, image_urls: Vec<String>) -> Self {
+        Self {
+            role: "user".into(),
+            content: content.into(),
+            image_urls: if image_urls.is_empty() { None } else { Some(image_urls) },
         }
     }
 
@@ -30,6 +45,7 @@ impl ChatMessage {
         Self {
             role: "assistant".into(),
             content: content.into(),
+            image_urls: None,
         }
     }
 
@@ -37,6 +53,7 @@ impl ChatMessage {
         Self {
             role: "tool".into(),
             content: content.into(),
+            image_urls: None,
         }
     }
 }
@@ -947,5 +964,55 @@ mod tests {
         let message = err.to_string();
 
         assert!(message.contains("non-prompt-guided"));
+    }
+
+    #[test]
+    fn user_with_images_sets_image_urls() {
+        let msg = ChatMessage::user_with_images(
+            "describe this",
+            vec!["https://cdn.discord.com/img.png".to_string()],
+        );
+        assert_eq!(msg.role, "user");
+        assert_eq!(msg.content, "describe this");
+        assert_eq!(
+            msg.image_urls,
+            Some(vec!["https://cdn.discord.com/img.png".to_string()])
+        );
+    }
+
+    #[test]
+    fn user_with_images_empty_vec_returns_none() {
+        let msg = ChatMessage::user_with_images("hello", vec![]);
+        assert_eq!(msg.image_urls, None);
+    }
+
+    #[test]
+    fn chat_message_serde_round_trip_preserves_image_urls() {
+        let msg = ChatMessage::user_with_images(
+            "look",
+            vec!["https://example.com/photo.jpg".to_string()],
+        );
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("image_urls"));
+        let deserialized: ChatMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.image_urls, msg.image_urls);
+    }
+
+    #[test]
+    fn chat_message_serde_round_trip_none_omits_field() {
+        let msg = ChatMessage::user("hello");
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(!json.contains("image_urls"));
+        let deserialized: ChatMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.image_urls, None);
+    }
+
+    #[test]
+    fn legacy_json_without_image_urls_deserializes_correctly() {
+        let json = r#"{"role":"user","content":"hello"}"#;
+        let msg: ChatMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.role, "user");
+        assert_eq!(msg.content, "hello");
+        assert_eq!(msg.image_urls, None);
     }
 }
